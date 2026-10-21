@@ -7,6 +7,7 @@ A WebSocket-based MQTT broker with MeshCore public key authentication.
 - **WebSocket MQTT**: Uses MQTT over WebSockets (not MQTT over TCP protocol)
 - **Public Key Authentication**: Clients authenticate using their MeshCore public keys
 - **Topic Authorization**: Controls access to meshcore/* topics
+- **Multi-Broker Peering & Forwarding**: Forward packets between multiple broker instances with loop prevention, bounded offline queues, and role-based peer authentication
 
 ## Authentication
 
@@ -77,6 +78,7 @@ SUBSCRIBER_3=monitor:yet-another-password:3
 - **Role 1 (Admin)**: Full access including `/internal` topics (contains PII), `$SYS/*` system topics, and ability to delete retained messages
 - **Role 2 (Full Access)**: Access to all public topics with no data filtering, cannot access `/internal` or `$SYS/*`
 - **Role 3 (Limited)**: Access to public topics only with sensitive data filtered (SNR, RSSI, score, stats, model, firmware_version removed from messages)
+- **Role 4 (Peer)**: Peer broker bridge accounts authorized to publish forwarded meshcore packets across any origin node ID
 
 ## Installation
 
@@ -162,6 +164,61 @@ Where:
 All published messages must be valid JSON and contain an `origin_id` field matching your authenticated public key. In the future, this requirement and the origin_id field may be removed, as they are a part of the MQTT session. For now, this is largely for backwards compatibility.
 
 Subscribers (read-only users) can subscribe to any topic including wildcards like `meshcore/#`.
+
+
+## Multi-Broker Peering & Forwarding
+
+Brokers can peer with one another to forward MeshCore packets across networks or administrative domains with built-in loop prevention.
+
+For a complete step-by-step setup walkthrough, visual diagrams, and multi-broker configuration tables, see the **[Multi-Broker Peering Guide](docs/broker-peering-guide.md)**.
+
+### How Peering Works
+
+1. **Local-Only Forwarding (Loop Prevention)**:
+   - Each broker only forwards packets published directly by its own connected local clients/radios.
+   - Packets received from peer brokers are delivered to local subscribers, but are **never re-forwarded** to other outbound peers.
+   - This ensures arbitrary topologies (e.g. mutual bidirectional sharing between Guy A and Guy B, or hub-and-spoke forwarding) will not loop or duplicate packets.
+
+2. **Forwarded Subtopics**:
+   - Forwarded: `packets`, `status`, `neighbors`, and `raw`.
+   - Strictly excluded: `/internal` (admin PII), `/serial/*`, and `$SYS/*`.
+
+3. **Inbound Peer Authentication (Role 4)**:
+   - Remote brokers authenticate into this broker as a Role 4 subscriber:
+     ```env
+     SUBSCRIBER_4=peer_guy_b:secure_peer_password_here:4
+     ```
+   - Role 4 credentials authorize the peer broker to publish packets across any valid origin node key without requiring individual JWT signatures per radio node.
+   - Abuse detection (duplicate detection, rate limiting, and anomaly tracking) is enforced against the packet's `origin_id`. If an individual node misbehaves, only that node's traffic is silenced without disconnecting the peer.
+
+4. **Outbound Peer Configuration**:
+   - Configure outbound peers in `.env` using `PEER_N=URL:username:password`:
+     ```env
+     # Forward local traffic to Guy A
+     PEER_1=ws://guy-a.example.com:8883:peer_user:peer_secret
+
+     # Forward local traffic to Guy B
+     PEER_2=wss://guy-b.example.com/mqtt:peer_user:peer_secret
+
+     # Maximum queue size per peer during brief disconnections (default: 1000)
+     PEER_QUEUE_MAX_SIZE=1000
+     ```
+   - If a peer broker is temporarily unreachable, outbound packets are buffered in a bounded FIFO queue and delivered in order upon reconnection. If the queue overflows, the oldest packets are dropped to prevent memory exhaustion.
+
+### Example Topology
+
+- **My Server**: configured with `PEER_1` (Guy A) and `PEER_2` (Guy B). Forwards all local traffic to Guy A and Guy B.
+- **Guy A**: configured with `PEER_1` (Guy B). Shares Guy A's unique local traffic with Guy B. Guy A will not re-forward traffic received from My Server.
+- **Guy B**: configured with `PEER_1` (Guy A). Shares Guy B's unique local traffic with Guy A. Guy B will not re-forward traffic received from My Server or Guy A.
+
+
+## Testing
+
+Run unit tests covering configuration parsing, topic filters, bounded queues, and peer validation:
+
+```bash
+npm test
+```
 
 
 ## Deployment

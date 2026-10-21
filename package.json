@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "node --loader ts-node/esm src/server.ts",
     "build": "tsc",
-    "start": "tsx src/server.ts"
+    "start": "tsx src/server.ts",
+    "test": "tsx --test test/**/*.test.ts"
   },
   "keywords": [
     "meshcore",
@@ -23,6 +24,7 @@
     "better-sqlite3": "^12.4.1",
     "dotenv": "^17.2.3",
     "ini": "^5.0.0",
+    "mqtt": "^5.16.1",
     "tsx": "^4.19.2",
     "websocket-stream": "^5.5.2",
     "ws": "^8.18.3"

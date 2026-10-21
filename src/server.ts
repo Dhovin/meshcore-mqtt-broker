@@ -7,12 +7,15 @@ import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
-import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
+import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig, loadPeerConfig } from './config';
+import { PeerBridgeManager, validatePeerPacket } from './peer-bridge';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
 const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
+const peerConfig = loadPeerConfig();
+const peerBridgeManager = new PeerBridgeManager(peerConfig);
 
 const WS_PORT = mqttConfig.wsPort;
 const HOST = mqttConfig.host;
@@ -38,7 +41,8 @@ enum ClientType {
 enum SubscriberRole {
   ADMIN = 1,           // Full access + can delete retained messages
   FULL_ACCESS = 2,     // Full access, no hidden data
-  LIMITED = 3          // All access but with hidden/sensitive data filtered
+  LIMITED = 3,         // All access but with hidden/sensitive data filtered
+  PEER = 4             // Peer broker bridge (can publish preserved origin packets)
 }
 
 // Load subscriber users from environment variables
@@ -72,7 +76,7 @@ while (true) {
     let role = SubscriberRole.LIMITED;
     if (roleStr) {
       const roleNum = parseInt(roleStr);
-      if (roleNum === 1 || roleNum === 2 || roleNum === 3) {
+      if (roleNum === 1 || roleNum === 2 || roleNum === 3 || roleNum === 4) {
         role = roleNum as SubscriberRole;
       }
     }
@@ -94,7 +98,8 @@ while (true) {
     const roleNames = {
       [SubscriberRole.ADMIN]: 'admin',
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
-      [SubscriberRole.LIMITED]: 'limited'
+      [SubscriberRole.LIMITED]: 'limited',
+      [SubscriberRole.PEER]: 'peer'
     };
     console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
@@ -127,6 +132,9 @@ function getClientLogPrefix(client: any): string {
   if (clientType === ClientType.PUBLISHER && client.publicKey) {
     return `[O:${client.publicKey.substring(0, 8)}]`;
   } else if (clientType === ClientType.SUBSCRIBER && client.username) {
+    if (client.role === SubscriberRole.PEER) {
+      return `[P:${client.username}]`;
+    }
     return `[S:${client.username}]`;
   }
   return `[C:${client.id}]`;
@@ -295,6 +303,43 @@ aedes.authorizePublish = (client, packet, callback) => {
       }
       console.log(`${logPrefix} [AUTHZ] ✗ Serial command denied (invalid topic format) -> ${packet.topic}`);
       callback(new Error('Invalid serial/commands topic format'));
+      return;
+    }
+
+    // Peer bridge subscribers (role 4) can publish forwarded meshcore packets
+    if (role === SubscriberRole.PEER) {
+      const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
+      if (!validation.valid) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer publish denied -> ${packet.topic} (${validation.error})`);
+        callback(new Error(validation.error || 'Peer publish validation failed'));
+        return;
+      }
+
+      packet.topic = validation.normalizedTopic!;
+      const originId = validation.originId!;
+      const normalizedLocation = validation.normalizedLocation!;
+
+      // Enforce abuse detection on peer traffic per origin_id
+      if (!abuseDetector.getClientStats(originId)) {
+        const clientIP = (client as any).conn?.clientIP;
+        abuseDetector.initializeClient(originId, `peer_${originId}`, clientIP);
+      }
+
+      const trustState = abuseDetector.getClientStats(originId);
+      if (trustState) {
+        abuseDetector.checkIataChange(trustState, normalizedLocation);
+        const allowed = abuseDetector.recordPacket({ publicKey: originId }, packet);
+        if (abuseConfig.enforcementEnabled && !allowed) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Peer packet silenced (abuse detected for origin ${originId.substring(0, 8)})`);
+          callback(new Error('Origin silenced due to abuse detection'));
+          return;
+        }
+      }
+
+      // Tag packet as fromPeer so it will NOT be forwarded to other peers
+      (packet as any).fromPeer = true;
+      console.log(`${logPrefix} [AUTHZ] ✓ Peer publish authorized -> ${packet.topic} [origin: ${originId.substring(0, 8)}]`);
+      callback(null);
       return;
     }
     
@@ -797,6 +842,15 @@ aedes.on('publish', (packet, client) => {
   if (client) {
     const logPrefix = getClientLogPrefix(client);
     console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
+
+    // Forward local traffic to configured outbound peer brokers
+    // Only forward packets from direct publishers that did not arrive from a peer broker
+    const clientType = (client as any).clientType;
+    const isFromPeer = (packet as any).fromPeer === true;
+
+    if (clientType === ClientType.PUBLISHER && !isFromPeer) {
+      peerBridgeManager.forwardLocalPacket(packet);
+    }
   } else {
     console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
   }
@@ -981,12 +1035,18 @@ httpServer.listen(WS_PORT, HOST, () => {
     console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
   }
   console.log('');
+  console.log(`  3. Outbound Peer Bridges: ${peerConfig.peers.length} peer(s) configured`);
+  if (peerConfig.peers.length > 0) {
+    console.log('     Targets:', peerConfig.peers.map(p => `${p.id} (${p.url})`).join(', '));
+  }
+  console.log('');
   console.log('Ready to accept connections...');
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  peerBridgeManager.shutdown();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
@@ -996,6 +1056,7 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  peerBridgeManager.shutdown();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');

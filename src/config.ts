@@ -83,3 +83,66 @@ export function loadAbuseConfig(): AbuseConfig {
   };
 }
 
+export interface PeerTarget {
+  id: string;
+  url: string;
+  username: string;
+  password: string;
+}
+
+export interface PeerConfig {
+  peers: PeerTarget[];
+  maxQueueSize: number;
+}
+
+// Parse a single PEER_N config string in format: URL:username:password
+// e.g. ws://guy-a.example.com:8883:peer_user:peer_secret
+export function parsePeerString(peerStr: string, id: string): PeerTarget | null {
+  const trimmed = peerStr.trim();
+  const lastColon = trimmed.lastIndexOf(':');
+  if (lastColon === -1) return null;
+  const secondLastColon = trimmed.lastIndexOf(':', lastColon - 1);
+  if (secondLastColon === -1) return null;
+
+  let url = trimmed.substring(0, secondLastColon).trim();
+  const username = trimmed.substring(secondLastColon + 1, lastColon).trim();
+  const password = trimmed.substring(lastColon + 1).trim();
+
+  if (!url || !username || !password) return null;
+
+  if (!url.includes('://')) {
+    url = `ws://${url}`;
+  }
+
+  return { id, url, username, password };
+}
+
+// Load outbound peer configuration (PEER_1, PEER_2, ...)
+export function loadPeerConfig(): PeerConfig {
+  const peers: PeerTarget[] = [];
+  let peerIndex = 1;
+
+  while (true) {
+    const peerEnvVar = process.env[`PEER_${peerIndex}`];
+    if (!peerEnvVar) {
+      break;
+    }
+
+    const peer = parsePeerString(peerEnvVar, `peer_${peerIndex}`);
+    if (peer) {
+      peers.push(peer);
+      console.log(`[CONFIG] Loaded outbound peer: ${peer.id} -> ${peer.url} (user: ${peer.username})`);
+    } else {
+      console.warn(`[CONFIG] Invalid format for PEER_${peerIndex}: "${peerEnvVar}". Expected URL:username:password`);
+    }
+
+    peerIndex++;
+  }
+
+  const maxQueueSize = parseInt(process.env.PEER_QUEUE_MAX_SIZE || '1000', 10);
+
+  return {
+    peers,
+    maxQueueSize: isNaN(maxQueueSize) || maxQueueSize <= 0 ? 1000 : maxQueueSize,
+  };
+}
