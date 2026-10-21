@@ -2,12 +2,16 @@ import Aedes from 'aedes';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
+import { timingSafeEqual } from 'crypto';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
+import { timingSafeCompare } from './crypto-utils';
+
+export { timingSafeCompare };
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
@@ -143,8 +147,8 @@ aedes.authenticate = async (client, username, password, callback) => {
 
     // Check if this is a subscriber login
     if (subscriberUsers.has(usernameStr)) {
-      const expectedPassword = subscriberUsers.get(usernameStr);
-      if (passwordStr === expectedPassword) {
+      const expectedPassword = subscriberUsers.get(usernameStr) || '';
+      if (timingSafeCompare(passwordStr, expectedPassword)) {
         // Check connection limit before allowing
         const maxConn = subscriberMaxConnections.get(usernameStr) || subscriberConfig.defaultMaxConnections;
         const activeConns = subscriberActiveConnections.get(usernameStr) || new Set();
@@ -223,6 +227,26 @@ aedes.authenticate = async (client, username, password, callback) => {
       callback(null, false);
       return;
     }
+
+    // Validate expiration claim if configured (disabled by default for compatibility with offline/clockless nodes)
+    if (mqttConfig.enforceExpiration && tokenPayload.exp) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (nowSec > tokenPayload.exp) {
+        console.log(`${logPrefix} [AUTH] ✗ Expired token: exp=${tokenPayload.exp}, now=${nowSec}`);
+        callback(null, false);
+        return;
+      }
+    }
+
+    // Sanity check future issued-at claim (reject tokens claiming to be from >24h in the future)
+    if (tokenPayload.iat) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      if (tokenPayload.iat > nowSec + 86400) {
+        console.log(`${logPrefix} [AUTH] ✗ Token iat is too far in future: iat=${tokenPayload.iat}, now=${nowSec}`);
+        callback(null, false);
+        return;
+      }
+    }
     
     const shortKey = publicKey.substring(0, 8);
     console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
@@ -257,6 +281,13 @@ aedes.authorizePublish = (client, packet, callback) => {
   
   const logPrefix = getClientLogPrefix(client);
   const clientType = (client as any).clientType;
+
+  // Enforce maximum packet payload size to prevent event loop freezes and memory exhaustion
+  if (packet.payload && packet.payload.length > mqttConfig.maxPacketBytes) {
+    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+    callback(new Error(`Payload size exceeds maximum allowed size of ${mqttConfig.maxPacketBytes} bytes`));
+    return;
+  }
   
   // Important: Strip retain flag from /status messages to prevent stale data on ingestor restart
   // LWT (offline) messages are also STATUS messages and should NOT be retained
@@ -411,6 +442,13 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Special handling for serial/responses - payload is a JWT string, not JSON
     // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/responses
     const subtopic = topicParts.slice(3).join('/');
+
+    // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is blocked
+    if (subtopic === 'internal') {
+      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      callback(new Error('Clients are not permitted to publish directly to /internal subtopics'));
+      return;
+    }
     if (subtopic === 'serial/responses') {
       const payload = packet.payload.toString('utf-8');
       // Validate it looks like a JWT (3 base64url parts separated by dots)
@@ -815,17 +853,29 @@ aedes.on('clientError', (client, err) => {
 
 // Create HTTP server for WebSocket
 const httpServer = createServer((req, res) => {
+  const clientIP = getClientIP(req);
+
+  // Reject HTTP requests from blocked IPs
+  if (rateLimiter.isBlocked(clientIP)) {
+    console.log(`[RATE_LIMIT] Rejecting HTTP request from blocked IP: ${clientIP}`);
+    req.socket.destroy();
+    return;
+  }
+
   // If this is not a WebSocket upgrade request, redirect to analyzer
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to analyzer`);
+    console.log(`[HTTP] Non-WebSocket request from ${clientIP}, redirecting to analyzer`);
     res.writeHead(301, { 'Location': 'https://analyzer.letsmesh.net/' });
     res.end();
     return;
   }
 });
 
-// Create WebSocket server
-const wsServer = new WebSocketServer({ server: httpServer });
+// Create WebSocket server with bounded maxPayload to prevent unauthenticated memory exhaustion
+const wsServer = new WebSocketServer({
+  server: httpServer,
+  maxPayload: 1024 * 1024 // 1MB max frame size
+});
 
 wsServer.on('connection', (ws, req) => {
   try {
@@ -894,7 +944,7 @@ wsServer.on('connection', (ws, req) => {
     }
   });
 
-  // Forward WebSocket messages to the stream
+  // Forward WebSocket messages to the stream with backpressure handling
   ws.on('message', (data) => {
     // Log MQTT PINGREQ packets (0xC0 = PINGREQ) with client identifier
     if (data instanceof Buffer && data.length >= 2 && data[0] === 0xC0) {
@@ -906,7 +956,18 @@ wsServer.on('connection', (ws, req) => {
         console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
       }
     }
-    stream.push(data);
+    const canAcceptMore = stream.push(data);
+    if (!canAcceptMore && ws.readyState === ws.OPEN) {
+      // Pause incoming WebSocket reads when duplex buffer is full
+      ws.pause();
+    }
+  });
+
+  // Resume WebSocket reads when the duplex stream drains
+  stream.on('drain', () => {
+    if (ws.readyState === ws.OPEN) {
+      ws.resume();
+    }
   });
 
   // Store client IP on stream for logging
@@ -987,6 +1048,7 @@ httpServer.listen(WS_PORT, HOST, () => {
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  rateLimiter.destroy();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
@@ -996,6 +1058,7 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  rateLimiter.destroy();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
