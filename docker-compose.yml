@@ -1,0 +1,67 @@
+services:
+  meshcore-broker:
+    image: ghcr.io/dhovin/meshcore-mqtt-broker:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meshcore-mqtt-broker
+    restart: unless-stopped
+    ports:
+      - "${MQTT_WS_PORT:-8883}:8883"
+      - "${MQTT_TCP_PORT:-1883}:${MQTT_TCP_PORT:-1883}"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - MQTT_WS_PORT=${MQTT_WS_PORT:-8883}
+      - ENABLE_TCP_MQTT=${ENABLE_TCP_MQTT:-false}
+      - MQTT_TCP_PORT=${MQTT_TCP_PORT:-1883}
+      - MQTT_HOST=${MQTT_HOST:-0.0.0.0}
+      - AUTH_EXPECTED_AUDIENCE=${AUTH_EXPECTED_AUDIENCE:-mqtt.yourdomain.com}
+      - HTTP_REDIRECT_URL=${HTTP_REDIRECT_URL:-}
+      # Subscribe-Only Accounts (format: username:password:role:maxConnections)
+      # Role: 1=admin, 2=full_access, 3=limited (default). maxConnections: override count or default
+      - SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=${SUBSCRIBER_MAX_CONNECTIONS_DEFAULT:-2}
+      - SUBSCRIBER_1=${SUBSCRIBER_1:-}
+      - SUBSCRIBER_2=${SUBSCRIBER_2:-}
+      - SUBSCRIBER_3=${SUBSCRIBER_3:-}
+      - ABUSE_ENFORCEMENT_ENABLED=${ABUSE_ENFORCEMENT_ENABLED:-false}
+      - ABUSE_DUPLICATE_WINDOW_SIZE=${ABUSE_DUPLICATE_WINDOW_SIZE:-100}
+      - ABUSE_DUPLICATE_WINDOW_MS=${ABUSE_DUPLICATE_WINDOW_MS:-300000}
+      - ABUSE_DUPLICATE_THRESHOLD=${ABUSE_DUPLICATE_THRESHOLD:-10}
+      - ABUSE_MAX_DUPLICATES_PER_PACKET=${ABUSE_MAX_DUPLICATES_PER_PACKET:-5}
+      - ABUSE_DUPLICATE_RATE_THRESHOLD=${ABUSE_DUPLICATE_RATE_THRESHOLD:-0.3}
+      - ABUSE_DUPLICATE_RATE_WINDOW_MS=${ABUSE_DUPLICATE_RATE_WINDOW_MS:-300000}
+      - ABUSE_BUCKET_CAPACITY=${ABUSE_BUCKET_CAPACITY:-20}
+      - ABUSE_BUCKET_REFILL_RATE=${ABUSE_BUCKET_REFILL_RATE:-3}
+      - ABUSE_MAX_PACKET_SIZE=${ABUSE_MAX_PACKET_SIZE:-255}
+      - ABUSE_MAX_TOPICS_PER_DAY=${ABUSE_MAX_TOPICS_PER_DAY:-3}
+      - ABUSE_ANOMALY_THRESHOLD=${ABUSE_ANOMALY_THRESHOLD:-10}
+      - ABUSE_MAX_IATA_CHANGES_24H=${ABUSE_MAX_IATA_CHANGES_24H:-3}
+      - ABUSE_TOPIC_HISTORY_SIZE=${ABUSE_TOPIC_HISTORY_SIZE:-50}
+      - ABUSE_TOPIC_HISTORY_WINDOW_MS=${ABUSE_TOPIC_HISTORY_WINDOW_MS:-86400000}
+      - ABUSE_PERSISTENCE_PATH=${ABUSE_PERSISTENCE_PATH:-/data/abuse-detection.db}
+      - ABUSE_PERSISTENCE_INTERVAL_MS=${ABUSE_PERSISTENCE_INTERVAL_MS:-300000}
+      - ABUSE_STATE_RETENTION_MS=${ABUSE_STATE_RETENTION_MS:-604800000}
+    volumes:
+      - meshcore_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://127.0.0.1:8883/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Optional Watchtower service for automatic container updates
+  # Uncomment below to automatically pull new GHCR image builds and restart the broker
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower-meshcore
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --interval 86400 meshcore-mqtt-broker
+
+volumes:
+  meshcore_data:
+    driver: local

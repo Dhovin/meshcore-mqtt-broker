@@ -1,5 +1,6 @@
 import Aedes from 'aedes';
 import { createServer } from 'http';
+import { createServer as createTcpServer } from 'net';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
@@ -15,8 +16,11 @@ const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
 
 const WS_PORT = mqttConfig.wsPort;
+const TCP_PORT = mqttConfig.tcpPort;
+const ENABLE_TCP = mqttConfig.enableTcp;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
+const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
 
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
@@ -815,11 +819,18 @@ aedes.on('clientError', (client, err) => {
 
 // Create HTTP server for WebSocket
 const httpServer = createServer((req, res) => {
-  // If this is not a WebSocket upgrade request, redirect to analyzer
+  // If this is not a WebSocket upgrade request, handle standard HTTP request
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to analyzer`);
-    res.writeHead(301, { 'Location': 'https://analyzer.letsmesh.net/' });
-    res.end();
+    if (HTTP_REDIRECT_URL) {
+      console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to ${HTTP_REDIRECT_URL}`);
+      res.writeHead(302, { 'Location': HTTP_REDIRECT_URL });
+      res.end();
+      return;
+    }
+
+    console.log(`[HTTP] Non-WebSocket status request from ${getClientIP(req)}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', service: 'MeshCore MQTT Broker' }));
     return;
   }
 });
@@ -962,11 +973,37 @@ wsServer.on('connection', (ws, req) => {
   }
 });
 
+// Create optional TCP server for raw MQTT connections (e.g. Mosquitto bridge)
+let tcpServer: any = null;
+if (ENABLE_TCP) {
+  tcpServer = createTcpServer((socket: any) => {
+    const clientIP = socket.remoteAddress || 'unknown';
+    console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
+    (socket as any).clientIP = clientIP;
+    (socket as any).authenticated = false;
+    aedes.handle(socket);
+  });
+
+  tcpServer.listen(TCP_PORT, HOST, () => {
+    console.log(`TCP MQTT listening on:       mqtt://${HOST}:${TCP_PORT}`);
+  });
+}
+
 httpServer.listen(WS_PORT, HOST, () => {
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
+  console.log('║         MeshCore MQTT Broker                               ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
+  if (ENABLE_TCP) {
+    console.log(`Standard TCP MQTT listening on: mqtt://${HOST}:${TCP_PORT}`);
+  } else {
+    console.log('Standard TCP MQTT:          Disabled (ENABLE_TCP_MQTT=false)');
+  }
+  if (HTTP_REDIRECT_URL) {
+    console.log(`HTTP Browser Redirect:      ${HTTP_REDIRECT_URL}`);
+  } else {
+    console.log('HTTP Browser Redirect:      Disabled (serving 200 OK status)');
+  }
   console.log('');
   console.log('Authentication Modes:');
   console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
@@ -985,20 +1022,18 @@ httpServer.listen(WS_PORT, HOST, () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+const handleShutdown = () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  if (tcpServer) {
+    tcpServer.close();
+  }
+  httpServer.close();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
   });
-});
+};
 
-process.on('SIGTERM', () => {
-  console.log('\n[SHUTDOWN] Closing MQTT broker...');
-  abuseDetector.shutdown();
-  aedes.close(() => {
-    console.log('[SHUTDOWN] Broker closed');
-    process.exit(0);
-  });
-});
+process.on('SIGINT', handleShutdown);
+process.on('SIGTERM', handleShutdown);
