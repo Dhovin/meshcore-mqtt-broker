@@ -78,6 +78,33 @@ SUBSCRIBER_3=monitor:yet-another-password:3
 - **Role 2 (Full Access)**: Access to all public topics with no data filtering, cannot access `/internal` or `$SYS/*`
 - **Role 3 (Limited)**: Access to public topics only with sensitive data filtered (SNR, RSSI, score, stats, model, firmware_version removed from messages)
 
+## Broker Peering
+
+A broker can forward the traffic of its observers to other meshcore-mqtt-brokers. Observers sign their token for *your* broker's audience, so the receiving (upstream) broker has to be told which audience to accept for forwarded connections. This is done with a peer name in the connection path.
+
+**On your broker** (the one observers connect to), add each upstream broker:
+
+```bash
+UPSTREAM_PEER_1=wss://mqtt.upstreambroker.com:443/_mybroker
+UPSTREAM_PEER_1_SECRET=shared-secret        # optional, must match the upstream's DOWNSTREAM_PEER_N_SECRET
+```
+
+**On the upstream broker**, register your broker as a downstream peer:
+
+```bash
+DOWNSTREAM_PEER_1=mybroker:mqtt.mybroker.com   # name:audience[,audience...]
+DOWNSTREAM_PEER_1_SECRET=shared-secret          # optional
+```
+
+How it works:
+
+- For every observer that authenticates on your broker, one MQTT connection per upstream peer is opened using the observer's own username and signed token, and every message the observer is authorized to publish is forwarded on it. The observer's last will is mirrored, so the upstream also sees it go offline.
+- The upstream broker sees the connection arrive on `/_mybroker`, looks up that downstream peer and validates the token against `mqtt.mybroker.com` instead of its own `AUTH_EXPECTED_AUDIENCE`. All other checks (signature, expiry, topic/public key, `origin_id`) still apply.
+- Connections on `/_<name>` for a peer that isn't defined are denied (HTTP 403), as are connections with a wrong or missing secret (HTTP 401). Connections on any other path behave exactly as before.
+- Both lists can hold any number of peers (`_1`, `_2`, ...), and a broker can be both upstream and downstream. Each forwarded connection carries an `X-MeshCore-Via` chain of broker identities (their `AUTH_EXPECTED_AUDIENCE`), so loops between peers are refused (HTTP 508).
+- Forwarding across more than one hop (A → B → C) needs C to list A's audience for peer B as well, e.g. `DOWNSTREAM_PEER_1=b:mqtt.b.com,mqtt.a.com`.
+- Using a secret is strongly recommended. Peers that present a valid secret are exempt from per-IP failed-connection limiting, since many observers share the forwarding broker's IP. Without a secret, anyone holding a token for the downstream audience could use that peer path.
+
 ## Installation
 
 ```bash

@@ -41,6 +41,93 @@ export function loadSubscriberConfig() {
   };
 }
 
+// Broker peering
+//
+// Upstream peers: brokers this broker forwards its publishers' traffic to.
+//   UPSTREAM_PEER_N=wss://mqtt.upstream.com:443/_mybroker
+//   UPSTREAM_PEER_N_SECRET=optional-shared-secret
+// The path segment after "/_" is the name this broker is registered under on the upstream.
+//
+// Downstream peers: brokers allowed to forward their publishers' traffic to this broker.
+//   DOWNSTREAM_PEER_N=mybroker:mqtt.mybroker.com[,another.audience.com]
+//   DOWNSTREAM_PEER_N_SECRET=optional-shared-secret
+// Connections on path "/_mybroker" validate publisher tokens against the listed audience(s)
+// instead of AUTH_EXPECTED_AUDIENCE. Connections on "/_<name>" for an undefined peer are denied.
+
+export interface UpstreamPeerConfig {
+  url: string;
+  host: string;
+  name: string;
+  secret?: string;
+}
+
+export interface DownstreamPeerConfig {
+  name: string;
+  audiences: string[];
+  secret?: string;
+}
+
+export const PEER_NAME_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const PEER_PATH_REGEX = /^\/_([^/]*)\/?$/;
+
+function fatalConfig(message: string): never {
+  console.error(`FATAL: ${message}`);
+  process.exit(1);
+}
+
+export function loadPeerConfig() {
+  const upstream: UpstreamPeerConfig[] = [];
+  for (let i = 1; process.env[`UPSTREAM_PEER_${i}`]; i++) {
+    const raw = process.env[`UPSTREAM_PEER_${i}`]!.trim();
+    let parsed: URL;
+    try {
+      parsed = new URL(raw);
+    } catch {
+      fatalConfig(`UPSTREAM_PEER_${i} is not a valid URL: ${raw}`);
+    }
+    if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {
+      fatalConfig(`UPSTREAM_PEER_${i} must use ws:// or wss:// (got ${parsed.protocol})`);
+    }
+    if (parsed.username || parsed.password) {
+      fatalConfig(`UPSTREAM_PEER_${i} must not contain credentials; use UPSTREAM_PEER_${i}_SECRET instead`);
+    }
+    const match = parsed.pathname.match(PEER_PATH_REGEX);
+    if (!match || !PEER_NAME_REGEX.test(match[1])) {
+      fatalConfig(`UPSTREAM_PEER_${i} path must be /_<peer-name> (e.g. wss://mqtt.upstream.com:443/_mybroker), got: ${parsed.pathname}`);
+    }
+    upstream.push({
+      url: parsed.toString(),
+      host: parsed.host,
+      name: match[1],
+      secret: process.env[`UPSTREAM_PEER_${i}_SECRET`] || undefined,
+    });
+  }
+
+  const downstream = new Map<string, DownstreamPeerConfig>();
+  for (let i = 1; process.env[`DOWNSTREAM_PEER_${i}`]; i++) {
+    const raw = process.env[`DOWNSTREAM_PEER_${i}`]!.trim();
+    const sep = raw.indexOf(':');
+    const name = sep === -1 ? raw : raw.substring(0, sep).trim();
+    const audiences = sep === -1 ? [] : raw.substring(sep + 1).split(',').map(a => a.trim()).filter(Boolean);
+    if (!PEER_NAME_REGEX.test(name)) {
+      fatalConfig(`DOWNSTREAM_PEER_${i} has an invalid peer name "${name}" (allowed: letters, digits, . _ -)`);
+    }
+    if (audiences.length === 0) {
+      fatalConfig(`DOWNSTREAM_PEER_${i} must be in the format name:audience[,audience...]`);
+    }
+    if (downstream.has(name)) {
+      fatalConfig(`DOWNSTREAM_PEER_${i} duplicates peer name "${name}"`);
+    }
+    downstream.set(name, {
+      name,
+      audiences,
+      secret: process.env[`DOWNSTREAM_PEER_${i}_SECRET`] || undefined,
+    });
+  }
+
+  return { upstream, downstream };
+}
+
 // Validate and load abuse detection configuration
 export function loadAbuseConfig(): AbuseConfig {
   validateRequiredEnvVars([

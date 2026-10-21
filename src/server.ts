@@ -1,22 +1,28 @@
 import Aedes from 'aedes';
-import { createServer } from 'http';
+import { createServer, IncomingMessage } from 'http';
 import { WebSocketServer } from 'ws';
+import { randomUUID, timingSafeEqual } from 'crypto';
 import { Duplex } from 'stream';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
 import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
-import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
+import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig, loadPeerConfig, DownstreamPeerConfig, PEER_PATH_REGEX } from './config';
+import { PeerForwarder, PEER_SECRET_HEADER, PEER_VIA_HEADER, MAX_PEER_HOPS } from './peers';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
 const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
+const peerConfig = loadPeerConfig();
 
 const WS_PORT = mqttConfig.wsPort;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
+
+// Identity of this broker in the peer "via" chain, used to detect forwarding loops
+const BROKER_IDENTITY = EXPECTED_AUDIENCE || `broker-${randomUUID()}`;
 
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
@@ -119,13 +125,74 @@ const rateLimiter = new RateLimiter(60000, 10, 300000);
 // Abuse detection
 const abuseDetector = new AbuseDetector(abuseConfig);
 
+// Broker peering
+const peerForwarder = new PeerForwarder(peerConfig.upstream);
+for (const peer of peerConfig.upstream) {
+  console.log(`[CONFIG] Loaded upstream peer: ${peer.url} (as "${peer.name}"${peer.secret ? ', with secret' : ''})`);
+}
+for (const peer of peerConfig.downstream.values()) {
+  console.log(`[CONFIG] Loaded downstream peer: ${peer.name} (audience: ${peer.audiences.join(', ')}${peer.secret ? ', with secret' : ''})`);
+}
+
+function secretsMatch(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function getHeader(req: IncomingMessage, name: string): string {
+  const value = req.headers[name];
+  return (Array.isArray(value) ? value[0] : value) || '';
+}
+
+type PeerCheck =
+  | { ok: true; peer: DownstreamPeerConfig | null; via: string[] }
+  | { ok: false; code: number; message: string; countFailure: boolean };
+
+// Resolve a WebSocket upgrade request to a downstream peer based on its "/_<name>" path.
+// Requests on other paths are regular observer/subscriber connections.
+function checkDownstreamPeer(req: IncomingMessage): PeerCheck {
+  let pathname: string;
+  try {
+    pathname = new URL(req.url || '/', 'http://localhost').pathname;
+  } catch {
+    return { ok: true, peer: null, via: [] };
+  }
+  if (!pathname.startsWith('/_')) {
+    return { ok: true, peer: null, via: [] };
+  }
+  // Checked before the secret so blocked IPs can't keep guessing it
+  if (rateLimiter.isBlocked(getClientIP(req))) {
+    return { ok: false, code: 429, message: 'IP is blocked', countFailure: false };
+  }
+
+  const match = pathname.match(PEER_PATH_REGEX);
+  const peer = match ? peerConfig.downstream.get(match[1]) : undefined;
+  if (!peer) {
+    return { ok: false, code: 403, message: `Unknown peer path ${pathname}`, countFailure: true };
+  }
+  if (peer.secret && !secretsMatch(getHeader(req, PEER_SECRET_HEADER), peer.secret)) {
+    return { ok: false, code: 401, message: `Invalid secret for peer ${peer.name}`, countFailure: true };
+  }
+
+  const via = getHeader(req, PEER_VIA_HEADER).split(',').map(v => v.trim()).filter(Boolean);
+  if (via.includes(BROKER_IDENTITY)) {
+    return { ok: false, code: 508, message: `Forwarding loop via peer ${peer.name} (${via.join(' -> ')})`, countFailure: false };
+  }
+  if (via.length >= MAX_PEER_HOPS) {
+    return { ok: false, code: 508, message: `Too many forwarding hops via peer ${peer.name}`, countFailure: false };
+  }
+  return { ok: true, peer, via };
+}
+
 // Helper to get client identifier for logging
 function getClientLogPrefix(client: any): string {
   if (!client) return '[UNKNOWN]';
-  
+
   const clientType = client.clientType;
   if (clientType === ClientType.PUBLISHER && client.publicKey) {
-    return `[O:${client.publicKey.substring(0, 8)}]`;
+    const peerName = client.conn?.peer?.name;
+    return `[O:${client.publicKey.substring(0, 8)}${peerName ? `@${peerName}` : ''}]`;
   } else if (clientType === ClientType.SUBSCRIBER && client.username) {
     return `[S:${client.username}]`;
   }
@@ -217,22 +284,33 @@ aedes.authenticate = async (client, username, password, callback) => {
       return;
     }
     
-    // Validate audience claim if configured
-    if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
+    // Validate audience claim. Connections forwarded by a downstream peer carry tokens
+    // signed for that peer's audience rather than ours.
+    const stream = (client as any).conn;
+    const peer: DownstreamPeerConfig | null = stream?.peer || null;
+    if (peer) {
+      if (!peer.audiences.includes(tokenPayload.aud)) {
+        console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected for peer ${peer.name}: ${peer.audiences.join(', ')})`);
+        callback(null, false);
+        return;
+      }
+    } else if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
       callback(null, false);
       return;
     }
-    
+
     const shortKey = publicKey.substring(0, 8);
-    console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
+    console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}${peer ? ` [via peer: ${peer.name}]` : ''}`);
     // Store the public key and client type with the client for later use
     (client as any).publicKey = publicKey;
     (client as any).tokenPayload = tokenPayload;
     (client as any).clientType = ClientType.PUBLISHER;
-    
+    // Original credentials are reused to mirror this session to upstream peers
+    (client as any).authUsername = usernameStr;
+    (client as any).authToken = passwordStr;
+
     // Mark stream as authenticated
-    const stream = (client as any).conn;
     if (stream && stream.clientIP) {
       stream.authenticated = true;
     }
@@ -428,6 +506,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         return;
       }
       console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
+      peerForwarder.forward(client, packet);
       callback(null);
       return;
     }
@@ -543,6 +622,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         });
       }
       
+      peerForwarder.forward(client, packet);
       callback(null);
     } catch (error) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JSON or validation error)`);
@@ -766,6 +846,18 @@ aedes.on('client', (client) => {
       if (originalDestroy) originalDestroy(...args);
     };
   }
+  
+  // Mirror publisher sessions to upstream peers
+  if ((client as any).clientType === ClientType.PUBLISHER && peerForwarder.enabled) {
+    peerForwarder.open(client, {
+      username: (client as any).authUsername,
+      password: (client as any).authToken,
+      clientId: client.id,
+      publicKey: (client as any).publicKey,
+      will: (client as any).will,
+      via: [...(stream?.via || []), BROKER_IDENTITY],
+    });
+  }
 });
 
 aedes.on('clientDisconnect', (client) => {
@@ -778,6 +870,10 @@ aedes.on('clientDisconnect', (client) => {
   // Log additional info to debug why this client disconnected
   if (client) {
     console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
+    
+    // Close upstream peer links. Any will message was already published (and forwarded)
+    // by aedes before this event, so a graceful close avoids a duplicate upstream will.
+    peerForwarder.close(client);
     
     // Clean up subscriber connection tracking
     const clientType = (client as any).clientType;
@@ -825,21 +921,43 @@ const httpServer = createServer((req, res) => {
 });
 
 // Create WebSocket server
-const wsServer = new WebSocketServer({ server: httpServer });
+const wsServer = new WebSocketServer({
+  server: httpServer,
+  // Deny forwarding from undefined downstream peers before the upgrade completes
+  verifyClient: (info, cb) => {
+    const result = checkDownstreamPeer(info.req);
+    if (!result.ok) {
+      const clientIP = getClientIP(info.req);
+      console.log(`[PEER] ✗ Rejected connection from ${clientIP}: ${result.message} (HTTP ${result.code})`);
+      if (result.countFailure && rateLimiter.recordFailure(clientIP)) {
+        console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+      }
+      cb(false, result.code, result.message);
+      return;
+    }
+    (info.req as any).peerCheck = result;
+    cb(true);
+  }
+});
 
 wsServer.on('connection', (ws, req) => {
   try {
     const clientIP = getClientIP(req);
+    const peerCheck = (req as any).peerCheck;
+    const peer: DownstreamPeerConfig | null = peerCheck?.peer || null;
+    // Peers that proved a shared secret aggregate many observers behind one IP,
+    // so they are exempt from per-IP failed-connection limiting
+    const trustedPeer = !!peer?.secret;
     
     // Check if IP is blocked
-    if (rateLimiter.isBlocked(clientIP)) {
+    if (!trustedPeer && rateLimiter.isBlocked(clientIP)) {
       console.log(`[RATE_LIMIT] Rejecting connection from blocked IP: ${clientIP}`);
       // Terminate immediately without trying to send a close frame
       ws.terminate();
       return;
     }
     
-    console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
+    console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}${peer ? ` (peer: ${peer.name})` : ''}`);
   
   // Enable WebSocket ping/pong to keep connection alive
   ws.on('ping', (data) => {
@@ -911,6 +1029,8 @@ wsServer.on('connection', (ws, req) => {
 
   // Store client IP on stream for logging
   (stream as any).clientIP = clientIP;
+  (stream as any).peer = peer;
+  (stream as any).via = peerCheck?.via || [];
   (stream as any).authenticated = false;
   
   // Handle WebSocket close
@@ -928,7 +1048,7 @@ wsServer.on('connection', (ws, req) => {
       // Unauthenticated or invalid client - count as failed connection
       console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
       
-      if (!wasAuthenticated) {
+      if (!wasAuthenticated && !trustedPeer) {
         const blocked = rateLimiter.recordFailure(clientIP);
         if (blocked) {
           console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
@@ -981,6 +1101,10 @@ httpServer.listen(WS_PORT, HOST, () => {
     console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
   }
   console.log('');
+  console.log('Peering:');
+  console.log(`  Upstream peers (forwarding to): ${peerConfig.upstream.length ? peerConfig.upstream.map(p => p.url).join(', ') : 'none'}`);
+  console.log(`  Downstream peers (accepting from): ${peerConfig.downstream.size ? Array.from(peerConfig.downstream.values()).map(p => `/_${p.name} [aud: ${p.audiences.join(', ')}]`).join(', ') : 'none'}`);
+  console.log('');
   console.log('Ready to accept connections...');
 });
 
@@ -988,6 +1112,7 @@ httpServer.listen(WS_PORT, HOST, () => {
 process.on('SIGINT', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
+  peerForwarder.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
@@ -997,6 +1122,7 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   abuseDetector.shutdown();
+  peerForwarder.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
