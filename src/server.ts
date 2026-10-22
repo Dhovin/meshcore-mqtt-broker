@@ -9,13 +9,16 @@ import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig, loadPeerConfig } from './config';
 import { PeerBridgeManager, validatePeerPacket } from './peer-bridge';
+import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
 const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
 const peerConfig = loadPeerConfig();
-const peerBridgeManager = new PeerBridgeManager(peerConfig);
+
+let peerIdentity: PeerKeyPair;
+let peerBridgeManager: PeerBridgeManager;
 
 const WS_PORT = mqttConfig.wsPort;
 const HOST = mqttConfig.host;
@@ -34,7 +37,8 @@ function isValidIATACode(code: string): boolean {
 // Client types
 enum ClientType {
   SUBSCRIBER = 'subscriber',
-  PUBLISHER = 'publisher'
+  PUBLISHER = 'publisher',
+  PEER = 'peer'
 }
 
 // Subscriber roles
@@ -129,7 +133,9 @@ function getClientLogPrefix(client: any): string {
   if (!client) return '[UNKNOWN]';
   
   const clientType = client.clientType;
-  if (clientType === ClientType.PUBLISHER && client.publicKey) {
+  if (clientType === ClientType.PEER && client.publicKey) {
+    return `[P:${client.publicKey.substring(0, 8)}]`;
+  } else if (clientType === ClientType.PUBLISHER && client.publicKey) {
     return `[O:${client.publicKey.substring(0, 8)}]`;
   } else if (clientType === ClientType.SUBSCRIBER && client.username) {
     if (client.role === SubscriberRole.PEER) {
@@ -233,11 +239,19 @@ aedes.authenticate = async (client, username, password, callback) => {
     }
     
     const shortKey = publicKey.substring(0, 8);
-    console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
-    // Store the public key and client type with the client for later use
+    const isAuthorizedPeer = peerConfig.authorizedPeerKeys.has(publicKey);
+
+    if (isAuthorizedPeer) {
+      console.log(`[P:${shortKey}] [AUTH] ✓ Authorized peer broker authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
+      (client as any).clientType = ClientType.PEER;
+    } else {
+      console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
+      (client as any).clientType = ClientType.PUBLISHER;
+    }
+
+    // Store the public key and token payload with the client for later use
     (client as any).publicKey = publicKey;
     (client as any).tokenPayload = tokenPayload;
-    (client as any).clientType = ClientType.PUBLISHER;
     
     // Mark stream as authenticated
     const stream = (client as any).conn;
@@ -345,6 +359,43 @@ aedes.authorizePublish = (client, packet, callback) => {
     
     console.log(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
     callback(new Error('Subscriber clients are subscribe-only'));
+    return;
+  }
+
+  // Peer brokers (authenticated via MeshCore JWT) can publish forwarded meshcore packets
+  if (clientType === ClientType.PEER) {
+    const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
+    if (!validation.valid) {
+      console.log(`${logPrefix} [AUTHZ] ✗ Peer publish denied -> ${packet.topic} (${validation.error})`);
+      callback(new Error(validation.error || 'Peer publish validation failed'));
+      return;
+    }
+
+    packet.topic = validation.normalizedTopic!;
+    const originId = validation.originId!;
+    const normalizedLocation = validation.normalizedLocation!;
+
+    // Enforce abuse detection on peer traffic per origin_id
+    if (!abuseDetector.getClientStats(originId)) {
+      const clientIP = (client as any).conn?.clientIP;
+      abuseDetector.initializeClient(originId, `peer_${originId}`, clientIP);
+    }
+
+    const trustState = abuseDetector.getClientStats(originId);
+    if (trustState) {
+      abuseDetector.checkIataChange(trustState, normalizedLocation);
+      const allowed = abuseDetector.recordPacket({ publicKey: originId }, packet);
+      if (abuseConfig.enforcementEnabled && !allowed) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer packet silenced (abuse detected for origin ${originId.substring(0, 8)})`);
+        callback(new Error('Origin silenced due to abuse detection'));
+        return;
+      }
+    }
+
+    // Tag packet as fromPeer so it will NOT be forwarded to other peers
+    (packet as any).fromPeer = true;
+    console.log(`${logPrefix} [AUTHZ] ✓ Peer publish authorized -> ${packet.topic} [origin: ${originId.substring(0, 8)}]`);
+    callback(null);
     return;
   }
   
@@ -634,6 +685,13 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     return;
   }
   
+  // Peer clients are publish-only bridges
+  if (clientType === ClientType.PEER) {
+    console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (peer bridge is publish-only) -> ${subscription.topic}`);
+    callback(new Error('Peer bridges are publish-only'));
+    return;
+  }
+
   // Subscriber clients can subscribe to any topic (they're listeners)
   if (clientType === ClientType.SUBSCRIBER) {
     console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized -> ${subscription.topic}`);
@@ -1016,37 +1074,52 @@ wsServer.on('connection', (ws, req) => {
   }
 });
 
-httpServer.listen(WS_PORT, HOST, () => {
-  console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
-  console.log('╚════════════════════════════════════════════════════════════╝');
-  console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
-  console.log('');
-  console.log('Authentication Modes:');
-  console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
-  console.log('     Usernames:', Array.from(subscriberUsers.keys()).join(', '));
-  console.log('');
-  console.log('  2. Publishers (Publish-only):');
-  console.log('     Username: v1_{PUBLIC_KEY}');
-  console.log('     Password: JWT token signed with Ed25519 private key');
-  console.log('     Validation:');
-  console.log('       - origin_id must match authenticated public key');
-  if (EXPECTED_AUDIENCE) {
-    console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
-  }
-  console.log('');
-  console.log(`  3. Outbound Peer Bridges: ${peerConfig.peers.length} peer(s) configured`);
-  if (peerConfig.peers.length > 0) {
-    console.log('     Targets:', peerConfig.peers.map(p => `${p.id} (${p.url})`).join(', '));
-  }
-  console.log('');
-  console.log('Ready to accept connections...');
+async function startServer(): Promise<void> {
+  peerIdentity = await loadOrCreatePeerIdentity(peerConfig.peerPrivateKey);
+  peerBridgeManager = new PeerBridgeManager(peerConfig, peerIdentity);
+
+  httpServer.listen(WS_PORT, HOST, () => {
+    console.log('╔════════════════════════════════════════════════════════════╗');
+    console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
+    console.log('╚════════════════════════════════════════════════════════════╝');
+    console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
+    console.log('');
+    console.log('Authentication Modes:');
+    console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
+    console.log('     Usernames:', Array.from(subscriberUsers.keys()).join(', '));
+    console.log('');
+    console.log('  2. Publishers (Publish-only):');
+    console.log('     Username: v1_{PUBLIC_KEY}');
+    console.log('     Password: JWT token signed with Ed25519 private key');
+    console.log('     Validation:');
+    console.log('       - origin_id must match authenticated public key');
+    if (EXPECTED_AUDIENCE) {
+      console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
+    }
+    console.log('');
+    console.log(`  3. Peer Interconnect:`);
+    console.log(`     Broker Identity: ${peerIdentity.publicKeyHex.substring(0, 16)}...`);
+    console.log(`     Authorized Peer Keys: ${peerConfig.authorizedPeerKeys.size} key(s) configured`);
+    console.log(`     Outbound Peer Bridges: ${peerConfig.peers.length} peer(s) configured`);
+    if (peerConfig.peers.length > 0) {
+      console.log('     Targets:', peerConfig.peers.map(p => `${p.id} (${p.url}) [aud: ${p.targetAudience}]`).join(', '));
+    }
+    console.log('');
+    console.log('Ready to accept connections...');
+  });
+}
+
+startServer().catch((err) => {
+  console.error('[FATAL] Failed to start server:', err);
+  process.exit(1);
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
-  peerBridgeManager.shutdown();
+  if (peerBridgeManager) {
+    peerBridgeManager.shutdown();
+  }
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');
@@ -1056,7 +1129,9 @@ process.on('SIGINT', () => {
 
 process.on('SIGTERM', () => {
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
-  peerBridgeManager.shutdown();
+  if (peerBridgeManager) {
+    peerBridgeManager.shutdown();
+  }
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');

@@ -174,31 +174,36 @@ For a complete step-by-step setup walkthrough, visual diagrams, and multi-broker
 
 ### How Peering Works
 
-1. **Local-Only Forwarding (Loop Prevention)**:
-   - Each broker only forwards packets published directly by its own connected local clients/radios.
-   - Packets received from peer brokers are delivered to local subscribers, but are **never re-forwarded** to other outbound peers.
-   - This ensures arbitrary topologies (e.g. mutual bidirectional sharing between Guy A and Guy B, or hub-and-spoke forwarding) will not loop or duplicate packets.
+1. **Optimized Multiplexed Connection**:
+   - Exactly **one persistent WebSocket connection** runs between any two peered brokers.
+   - All packets for all connected radios and observers are multiplexed across this single trunk (no socket explosion).
 
-2. **Forwarded Subtopics**:
+2. **Native MeshCore JWT Authentication**:
+   - The sending broker authenticates with `username: v1_{BROKER_PUBLIC_KEY}` and a dynamically signed JWT (`password`) matching the remote broker's expected audience.
+   - The receiving broker verifies the JWT signature and validates that the broker's public key is in `AUTHORIZED_PEERS`.
+   - The outbound bridge auto-renews JWTs before expiration, keeping long-lived links healthy across restarts and reconnects.
+
+3. **Local-Only Forwarding (Loop Prevention)**:
+   - Each broker only forwards packets published directly by its own connected local clients/radios.
+   - Packets received from peer brokers are tagged `fromPeer = true`, delivered to local subscribers, and **never re-forwarded** to other outbound peers.
+   - Guaranteed loop-free routing across arbitrary topologies (e.g. mutual bidirectional sharing between Guy A and Guy B).
+
+4. **Forwarded Subtopics & Security**:
    - Forwarded: `packets`, `status`, `neighbors`, and `raw`.
    - Strictly excluded: `/internal` (admin PII), `/serial/*`, and `$SYS/*`.
+   - Abuse detection (duplicate detection, token bucket rate limiting, anomaly tracking) is enforced against the packet's `origin_id`. If an individual radio node misbehaves, only that node's traffic is silenced without disconnecting the peer trunk.
 
-3. **Inbound Peer Authentication (Role 4)**:
-   - Remote brokers authenticate into this broker as a Role 4 subscriber:
+5. **Outbound Peer Configuration**:
+   - Configure outbound peers in `.env` using `PEER_N=URL:target_audience`:
      ```env
-     SUBSCRIBER_4=peer_guy_b:secure_peer_password_here:4
-     ```
-   - Role 4 credentials authorize the peer broker to publish packets across any valid origin node key without requiring individual JWT signatures per radio node.
-   - Abuse detection (duplicate detection, rate limiting, and anomaly tracking) is enforced against the packet's `origin_id`. If an individual node misbehaves, only that node's traffic is silenced without disconnecting the peer.
+     # 1. Authorize inbound peer brokers by public key:
+     AUTHORIZED_PEERS=4852B69364572B52EFA1B6BB3E6D0ABED4F389A1CBFBB60A9BBA2CCE649CAF0E
 
-4. **Outbound Peer Configuration**:
-   - Configure outbound peers in `.env` using `PEER_N=URL:username:password`:
-     ```env
-     # Forward local traffic to Guy A
-     PEER_1=ws://guy-a.example.com:8883:peer_user:peer_secret
+     # 2. Forward local traffic to Guy A (with Guy A's audience claim):
+     PEER_1=wss://guy-a.example.com:443:guy_a_broker_audience
 
-     # Forward local traffic to Guy B
-     PEER_2=wss://guy-b.example.com/mqtt:peer_user:peer_secret
+     # 3. Forward local traffic to Guy B:
+     PEER_2=wss://guy-b.example.com/mqtt:guy_b_audience
 
      # Maximum queue size per peer during brief disconnections (default: 1000)
      PEER_QUEUE_MAX_SIZE=1000

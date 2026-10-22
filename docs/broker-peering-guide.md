@@ -31,10 +31,14 @@ sequenceDiagram
     participant BrokerB as Broker B (Receiver)
     participant Viewer as Broker B Subscribers
 
+    Note over BrokerA: Uses Broker A Ed25519 Keypair<br/>Signs JWT for Broker B Audience
+    BrokerA->>BrokerB: Single WebSocket MQTT CONNECT<br/>(user: v1_BROKER_A_KEY, pass: signed JWT)
+    BrokerB->>BrokerB: Standard verifyAuthToken & checks AUTHORIZED_PEERS
+    BrokerB-->>BrokerA: CONNACK (Authenticated as Peer)
     Radio->>BrokerA: Publishes local packet (v1_PUBKEY)
     BrokerA->>BrokerA: Delivers locally to Broker A subscribers
-    BrokerA->>BrokerB: Pushes packet via Outbound Bridge (PEER_1)
-    BrokerB->>BrokerB: Authenticates as Role 4 (Peer) & tags fromPeer=true
+    BrokerA->>BrokerB: Multiplexed on single bridge link (PEER_1)
+    BrokerB->>BrokerB: Validates topic, tags fromPeer=true & checks origin_id
     BrokerB->>Viewer: Delivers packet to Broker B subscribers
     Note over BrokerB: Packet is NOT forwarded to other peers (No Loops)
 ```
@@ -43,45 +47,54 @@ sequenceDiagram
 
 ## 3. Step-by-Step Instructions
 
-### Step 1: Create a Peer Account on the Receiving Broker
+### Step 1: Find or Configure the Sender's Broker Public Key
 
-On the broker that will **receive** traffic, add an inbound subscriber account with **Role 4** to `.env`:
-
-```bash
-# Format: SUBSCRIBER_N=username:password:role:maxConnections
-# Role 4 grants peer bridge privileges (allows publishing across all origin node keys)
-SUBSCRIBER_4=peer_from_brokera:SuperSecretPassword123:4
+Every broker has an Ed25519 peer identity. When starting up, the broker prints:
+```text
+  3. Peer Interconnect:
+     Broker Identity: 4852B69364572B52...
 ```
+*(If you want to pin a specific private key, set `PEER_PRIVATE_KEY` in `.env`. If omitted, the broker automatically generates a persistent identity saved to `data/peer-identity.json`).*
 
-> [!NOTE]
-> Role 4 accounts can only publish to valid meshcore traffic topics (`packets`, `status`, `neighbors`, `raw`). They cannot publish to administrative `/internal` topics or remote serial consoles.
-
-Restart the receiving broker to load the new credentials.
+Copy the sender broker's 64-hex **Public Key**.
 
 ---
 
-### Step 2: Configure the Outbound Bridge on the Sending Broker
+### Step 2: Authorize the Peer on the Receiving Broker
 
-On the broker that will **send** traffic, add the remote broker's URL and credentials to `.env`:
+On the broker that will **receive** traffic (Broker B), add Broker A's public key to `AUTHORIZED_PEERS` in `.env`:
 
 ```bash
-# Format: PEER_N=URL:username:password
-# Supported schemes: ws:// or wss://
-PEER_1=wss://broker-b.yourdomain.com:peer_from_brokera:SuperSecretPassword123
+# Comma-separated list of authorized peer broker public keys
+AUTHORIZED_PEERS=4852B69364572B52EFA1B6BB3E6D0ABED4F389A1CBFBB60A9BBA2CCE649CAF0E
+```
+
+> [!NOTE]
+> Peer brokers authenticated via JWT can only publish to valid meshcore traffic topics (`packets`, `status`, `neighbors`, `raw`). They cannot publish to administrative `/internal` topics or remote serial consoles.
+
+---
+
+### Step 3: Configure the Outbound Bridge on the Sending Broker
+
+On the broker that will **send** traffic (Broker A), add Broker B's URL and expected audience to `PEER_N` in `.env`:
+
+```bash
+# Format: PEER_N=URL:target_audience
+PEER_1=wss://broker-b.yourdomain.com:443:broker_b_expected_audience
 
 # Optional: Maximum queued packets during disconnections (default: 1000)
 PEER_QUEUE_MAX_SIZE=1000
 ```
 
 > [!TIP]
-> If your remote broker is behind Cloudflare Tunnels or SSL, use `wss://` (port 443 by default). If running directly on a private IP, use `ws://192.168.1.50:8883`.
+> `target_audience` is Broker B's `AUTH_EXPECTED_AUDIENCE` value. Broker A dynamically signs a fresh 24-hour MeshCore JWT token for Broker B's audience and automatically refreshes it before expiration.
 
-Restart the sending broker. In the console logs, you will see:
+Restart Broker A. In the console logs, you will see:
 ```text
-[CONFIG] Loaded outbound peer: peer_1 -> wss://broker-b.yourdomain.com (user: peer_from_brokera)
+[CONFIG] Loaded outbound peer: peer_1 -> wss://broker-b.yourdomain.com:443 (audience: broker_b_expected_audience)
 [PEER_BRIDGE] Initializing 1 outbound peer bridge(s) (queue limit: 1000)
-[PEER:peer_1] Connecting to wss://broker-b.yourdomain.com as "peer_from_brokera"...
-[PEER:peer_1] ✓ Connected to peer at wss://broker-b.yourdomain.com
+[PEER:peer_1] Connecting to wss://broker-b.yourdomain.com:443 via JWT [pubkey: 4852B693..., aud: broker_b_expected_audience]...
+[PEER:peer_1] ✓ Connected to peer at wss://broker-b.yourdomain.com:443
 ```
 
 ---
@@ -115,11 +128,11 @@ flowchart LR
 
 ### Server Configuration Summary
 
-| Server | Inbound Accounts Needed (`SUBSCRIBER_N`) | Outbound Peers Needed (`PEER_N`) |
+| Server | Inbound Peer Authorization (`AUTHORIZED_PEERS`) | Outbound Peers Needed (`PEER_N`) |
 | :--- | :--- | :--- |
-| **My Server** | *(None needed for peers, since neither Guy A nor B pushes to you)* | `PEER_1=wss://guya.com:my_peer:passA`<br>`PEER_2=wss://guyb.com:my_peer:passB` |
-| **Guy A** | `SUBSCRIBER_4=my_peer:passA:4`<br>`SUBSCRIBER_5=guy_b_peer:passBtoA:4` | `PEER_1=wss://guyb.com:guy_a_peer:passAtoB` |
-| **Guy B** | `SUBSCRIBER_4=my_peer:passB:4`<br>`SUBSCRIBER_5=guy_a_peer:passAtoB:4` | `PEER_1=wss://guya.com:guy_b_peer:passBtoA` |
+| **My Server** | *(None needed for peers, since neither Guy A nor B pushes to you)* | `PEER_1=wss://guya.com:443:guya_audience`<br>`PEER_2=wss://guyb.com:443:guyb_audience` |
+| **Guy A** | `AUTHORIZED_PEERS=MY_SERVER_KEY,GUY_B_KEY` | `PEER_1=wss://guyb.com:443:guyb_audience` |
+| **Guy B** | `AUTHORIZED_PEERS=MY_SERVER_KEY,GUY_A_KEY` | `PEER_1=wss://guya.com:443:guya_audience` |
 
 ### Why Routing Loops Cannot Happen
 1. When you publish packet $P_1$, it is forwarded to Guy A and Guy B.

@@ -86,38 +86,119 @@ export function loadAbuseConfig(): AbuseConfig {
 export interface PeerTarget {
   id: string;
   url: string;
-  username: string;
-  password: string;
+  targetAudience: string;
+  username?: string;
+  password?: string;
 }
 
 export interface PeerConfig {
+  peerPrivateKey?: string;
+  authorizedPeerKeys: Set<string>;
   peers: PeerTarget[];
   maxQueueSize: number;
 }
 
-// Parse a single PEER_N config string in format: URL:username:password
-// e.g. ws://guy-a.example.com:8883:peer_user:peer_secret
+// Parse a single PEER_N config string:
+// 1. JWT Interconnect: URL:targetAudience (e.g. ws://guy-a.example.com:8883:guy_a_audience)
+// 2. Legacy Credentials: URL:username:password (e.g. ws://guy-a.example.com:8883:peer_user:peer_pass)
 export function parsePeerString(peerStr: string, id: string): PeerTarget | null {
   const trimmed = peerStr.trim();
-  const lastColon = trimmed.lastIndexOf(':');
-  if (lastColon === -1) return null;
-  const secondLastColon = trimmed.lastIndexOf(':', lastColon - 1);
-  if (secondLastColon === -1) return null;
+  if (!trimmed) return null;
 
-  let url = trimmed.substring(0, secondLastColon).trim();
-  const username = trimmed.substring(secondLastColon + 1, lastColon).trim();
-  const password = trimmed.substring(lastColon + 1).trim();
-
-  if (!url || !username || !password) return null;
-
-  if (!url.includes('://')) {
-    url = `ws://${url}`;
+  let scheme = '';
+  let rest = trimmed;
+  const schemeMatch = trimmed.match(/^([a-zA-Z]+:\/\/)(.*)$/);
+  if (schemeMatch) {
+    scheme = schemeMatch[1].toLowerCase();
+    rest = schemeMatch[2];
+    if (scheme !== 'ws://' && scheme !== 'wss://') {
+      return null;
+    }
   }
 
-  return { id, url, username, password };
+  const parts = rest.split(':').map(p => p.trim());
+  if (parts.some(p => p.length === 0)) {
+    return null; // Reject strings like '::' or empty segments
+  }
+
+  if (scheme) {
+    // Has explicit ws:// or wss://
+    if (parts.length === 1) {
+      return null; // Missing audience or credentials
+    } else if (parts.length === 2) {
+      // ws://host/path:audience
+      return { id, url: `${scheme}${parts[0]}`, targetAudience: parts[1] };
+    } else if (parts.length === 3) {
+      // Could be:
+      // ws://host:port:audience
+      // or ws://host/path:username:password
+      const isPort = /^\d+$/.test(parts[1]) || /^\d+\//.test(parts[1]);
+      if (isPort) {
+        return { id, url: `${scheme}${parts[0]}:${parts[1]}`, targetAudience: parts[2] };
+      } else {
+        return { id, url: `${scheme}${parts[0]}`, targetAudience: parts[1], username: parts[1], password: parts[2] };
+      }
+    } else if (parts.length >= 4) {
+      // ws://host:port:username:password
+      const url = `${scheme}${parts[0]}:${parts[1]}`;
+      const username = parts[2];
+      const password = parts.slice(3).join(':');
+      return { id, url, targetAudience: username, username, password };
+    }
+  } else {
+    // No explicit scheme: prepends ws://
+    if (parts.length <= 2) {
+      return null; // e.g. 'one:colon' or 'nocolons'
+    } else if (parts.length === 3) {
+      // host:port:audience
+      const isPort = /^\d+$/.test(parts[1]) || /^\d+\//.test(parts[1]);
+      if (isPort) {
+        return { id, url: `ws://${parts[0]}:${parts[1]}`, targetAudience: parts[2] };
+      } else {
+        return { id, url: `ws://${parts[0]}`, targetAudience: parts[1], username: parts[1], password: parts[2] };
+      }
+    } else if (parts.length >= 4) {
+      // host:port:username:password
+      const url = `ws://${parts[0]}:${parts[1]}`;
+      const username = parts[2];
+      const password = parts.slice(3).join(':');
+      return { id, url, targetAudience: username, username, password };
+    }
+  }
+
+  return null;
 }
 
-// Load outbound peer configuration (PEER_1, PEER_2, ...)
+// Load authorized remote peer public keys (comma-separated or indexed)
+export function loadAuthorizedPeerKeys(): Set<string> {
+  const authorized = new Set<string>();
+
+  // 1. AUTHORIZED_PEERS=PUBKEY1,PUBKEY2
+  if (process.env.AUTHORIZED_PEERS) {
+    const keys = process.env.AUTHORIZED_PEERS.split(',')
+      .map(k => k.trim().toUpperCase())
+      .filter(k => /^[0-9A-F]{64}$/i.test(k));
+    for (const key of keys) {
+      authorized.add(key);
+    }
+  }
+
+  // 2. PEER_1_KEY, PEER_2_KEY...
+  let i = 1;
+  while (true) {
+    const key = process.env[`PEER_${i}_KEY`];
+    if (!key) break;
+    const clean = key.trim().toUpperCase();
+    if (/^[0-9A-F]{64}$/i.test(clean)) {
+      authorized.add(clean);
+    }
+    i++;
+  }
+
+  return authorized;
+}
+
+// Load peer configuration
 export function loadPeerConfig(): PeerConfig {
   const peers: PeerTarget[] = [];
   let peerIndex = 1;
@@ -131,17 +212,24 @@ export function loadPeerConfig(): PeerConfig {
     const peer = parsePeerString(peerEnvVar, `peer_${peerIndex}`);
     if (peer) {
       peers.push(peer);
-      console.log(`[CONFIG] Loaded outbound peer: ${peer.id} -> ${peer.url} (user: ${peer.username})`);
+      console.log(`[CONFIG] Loaded outbound peer: ${peer.id} -> ${peer.url} (audience: ${peer.targetAudience})`);
     } else {
-      console.warn(`[CONFIG] Invalid format for PEER_${peerIndex}: "${peerEnvVar}". Expected URL:username:password`);
+      console.warn(`[CONFIG] Invalid format for PEER_${peerIndex}: "${peerEnvVar}". Expected URL:targetAudience or URL:username:password`);
     }
 
     peerIndex++;
   }
 
+  const authorizedPeerKeys = loadAuthorizedPeerKeys();
+  if (authorizedPeerKeys.size > 0) {
+    console.log(`[CONFIG] Loaded ${authorizedPeerKeys.size} authorized peer public key(s)`);
+  }
+
   const maxQueueSize = parseInt(process.env.PEER_QUEUE_MAX_SIZE || '1000', 10);
 
   return {
+    peerPrivateKey: process.env.PEER_PRIVATE_KEY?.trim() || undefined,
+    authorizedPeerKeys,
     peers,
     maxQueueSize: isNaN(maxQueueSize) || maxQueueSize <= 0 ? 1000 : maxQueueSize,
   };

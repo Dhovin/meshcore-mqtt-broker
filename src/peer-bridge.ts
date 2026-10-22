@@ -1,5 +1,6 @@
 import mqtt, { MqttClient } from 'mqtt';
 import { PeerConfig, PeerTarget } from './config';
+import { PeerKeyPair, createPeerJwt } from './peer-crypto';
 
 export interface QueueItem {
   topic: string;
@@ -16,6 +17,7 @@ export interface PeerState {
   queue: QueueItem[];
   totalForwarded: number;
   totalDropped: number;
+  tokenRefreshTimer?: NodeJS.Timeout;
 }
 
 // Subtopics allowed for broker-to-broker forwarding
@@ -49,7 +51,7 @@ export interface PeerValidationResult {
   normalizedLocation?: string;
 }
 
-// Validate inbound packet published by a peer broker (Role 4)
+// Validate inbound packet published by a peer broker (JWT Peer or Role 4)
 export function validatePeerPacket(
   topic: string,
   payload: Buffer | string,
@@ -114,10 +116,12 @@ export function validatePeerPacket(
 export class PeerBridgeManager {
   private peers: Map<string, PeerState> = new Map();
   private maxQueueSize: number;
+  private identity?: PeerKeyPair;
   private shuttingDown: boolean = false;
 
-  constructor(config: PeerConfig) {
+  constructor(config: PeerConfig, identity?: PeerKeyPair) {
     this.maxQueueSize = config.maxQueueSize;
+    this.identity = identity;
 
     if (config.peers.length === 0) {
       console.log('[PEER_BRIDGE] No outbound peer brokers configured');
@@ -131,29 +135,66 @@ export class PeerBridgeManager {
     }
   }
 
-  private initPeer(target: PeerTarget): void {
+  private async initPeer(target: PeerTarget): Promise<void> {
     const logPrefix = `[PEER:${target.id}]`;
-    console.log(`${logPrefix} Connecting to ${target.url} as "${target.username}"...`);
-
-    const client = mqtt.connect(target.url, {
-      username: target.username,
-      password: target.password,
-      reconnectPeriod: 5000,
-      connectTimeout: 10000,
-      clean: true,
-      clientId: `meshcore_peer_${target.id}_${Math.random().toString(16).substring(2, 8)}`,
-    });
 
     const peerState: PeerState = {
       target,
-      client,
+      client: null as any,
       connected: false,
       queue: [],
       totalForwarded: 0,
       totalDropped: 0,
     };
-
     this.peers.set(target.id, peerState);
+
+    let username: string;
+    let password: string;
+
+    if (target.username && target.password) {
+      // Legacy credentials
+      username = target.username;
+      password = target.password;
+      console.log(`${logPrefix} Connecting to ${target.url} using credentials for "${username}"...`);
+    } else if (this.identity) {
+      // Native MeshCore JWT authentication
+      username = `v1_${this.identity.publicKeyHex}`;
+      password = await createPeerJwt(this.identity, target.targetAudience, 86400);
+      console.log(`${logPrefix} Connecting to ${target.url} via JWT [pubkey: ${this.identity.publicKeyHex.substring(0, 8)}..., aud: ${target.targetAudience}]...`);
+    } else {
+      console.error(`${logPrefix} Cannot connect to peer: neither credentials nor peer identity provided`);
+      return;
+    }
+
+    if (this.shuttingDown) return;
+
+    const clientId = `meshcore_peer_${target.id}_${Math.random().toString(16).substring(2, 8)}`;
+
+    const client = mqtt.connect(target.url, {
+      username,
+      password,
+      reconnectPeriod: 5000,
+      connectTimeout: 10000,
+      clean: true,
+      clientId,
+    });
+
+    peerState.client = client;
+
+    // If using JWT, periodically refresh token (every 12 hours) so reconnects always have fresh JWT
+    if (this.identity && !target.username) {
+      peerState.tokenRefreshTimer = setInterval(async () => {
+        try {
+          if (this.identity && peerState.client) {
+            const freshToken = await createPeerJwt(this.identity, target.targetAudience, 86400);
+            (peerState.client as any).options.password = freshToken;
+            console.log(`${logPrefix} Refreshed JWT token for target audience "${target.targetAudience}"`);
+          }
+        } catch (err: any) {
+          console.warn(`${logPrefix} Failed to refresh JWT token: ${err.message}`);
+        }
+      }, 12 * 60 * 60 * 1000);
+    }
 
     client.on('connect', () => {
       peerState.connected = true;
@@ -161,8 +202,17 @@ export class PeerBridgeManager {
       this.drainQueue(peerState);
     });
 
-    client.on('reconnect', () => {
+    client.on('reconnect', async () => {
       console.log(`${logPrefix} Reconnecting to ${target.url}...`);
+      // Update with fresh token on reconnect if using JWT
+      if (this.identity && !target.username) {
+        try {
+          const freshToken = await createPeerJwt(this.identity, target.targetAudience, 86400);
+          (client as any).options.password = freshToken;
+        } catch (err: any) {
+          console.warn(`${logPrefix} Error updating token on reconnect: ${err.message}`);
+        }
+      }
     });
 
     client.on('close', () => {
@@ -266,9 +316,14 @@ export class PeerBridgeManager {
   public shutdown(): void {
     this.shuttingDown = true;
     for (const [id, state] of this.peers.entries()) {
+      if (state.tokenRefreshTimer) {
+        clearInterval(state.tokenRefreshTimer);
+      }
       console.log(`[PEER:${id}] Disconnecting peer bridge client...`);
       try {
-        state.client.end(true);
+        if (state.client) {
+          state.client.end(true);
+        }
       } catch (err) {
         // Ignore errors during termination
       }
