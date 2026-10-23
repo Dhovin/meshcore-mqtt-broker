@@ -1,6 +1,6 @@
 # Deploying MeshCore MQTT Broker with Cloudflare Tunnels
 
-This guide shows you how to deploy the MQTT broker on a server (Dokploy, bare metal, VPS, etc.) and expose it securely over the internet with TLS using Cloudflare Tunnels.
+This guide shows you how to deploy the MQTT broker on a server (Dokploy, Docker, bare metal, VPS, etc.) and expose it securely over the internet with TLS using Cloudflare Tunnels.
 
 ## Overview
 
@@ -10,49 +10,50 @@ Cloudflare Tunnels provide a secure way to expose your MQTT broker to the intern
 - Dealing with dynamic IP addresses
 - Exposing your server's IP address
 
-The tunnel creates an encrypted connection from your server to Cloudflare's network, and Cloudflare handles all TLS termination.
+The tunnel creates an encrypted connection from your server to Cloudflare's network, and Cloudflare handles all TLS termination. The broker automatically reads the `CF-Connecting-IP` header provided by Cloudflare so that connection rate limiting and publisher IP tracking use the client's real IP address.
 
 ## Prerequisites
 
 - A server to run the MQTT broker (Linux recommended)
 - A Cloudflare account with a domain configured
 - Access to Cloudflare Zero Trust dashboard
-- Node.js 22+ installed on your server
+- Docker (recommended) or Node.js 22+ installed on your server
 
 ## Part 1: Deploy the MQTT Broker
 
 ### Option A: Deploying with Dokploy (Recommended)
 
-Dokploy uses Nixpacks to automatically detect and build Node.js/TypeScript projects.
+Dokploy can deploy the broker using its `Dockerfile` / Docker Compose (recommended, as all default environment variables are pre-configured) or via Nixpacks.
 
 1. **Create a new application in Dokploy**
    - Go to your Dokploy dashboard
    - Create a new application
-   - Connect your git repository
+   - Connect your git repository (and select **Dockerfile** as the build type, or provide all required variables from `.env.example` if using Nixpacks)
 
 2. **Configure environment variables**
    
-   In the Dokploy environment variables section, add:
+   In the Dokploy environment variables section, add (see `.env.example` for the full list of required variables if not using the `Dockerfile` build):
    
    ```bash
    MQTT_WS_PORT=8883
    MQTT_HOST=0.0.0.0
    AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
+   SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=2
    
-   # Add your subscriber users (as many as you need)
-   SUBSCRIBER_1=admin:your-secure-password-here
-   SUBSCRIBER_2=viewer:another-password
-   SUBSCRIBER_3=monitor:yet-another-password
+   # Add your subscriber users sequentially (format: username:password:role:maxConnections)
+   # Roles: 1=admin, 2=full_access, 3=limited (default if omitted)
+   SUBSCRIBER_1=admin:your-secure-password-here:1:10
+   SUBSCRIBER_2=viewer:another-password:2
+   SUBSCRIBER_3=monitor:yet-another-password:3:D
    ```
 
 3. **Deploy**
    
    Dokploy will automatically:
    - Install dependencies (`npm install`)
-   - Build the TypeScript code (`npm run build`)
-   - Start the server (`npm start`)
+   - Build and start the server (`npm start`)
 
-4. Expose the MQTT broker
+4. **Expose the MQTT broker locally**
    
    - Go to your Dokploy dashboard
    - Click on the application
@@ -63,14 +64,14 @@ Dokploy uses Nixpacks to automatically detect and build Node.js/TypeScript proje
    - Select Targeting Port: **`8883` over TCP**
    - Click **Create**
 
-Note: In your firewall settings (whether on the server or part of your network), you should not open port 8883. The Cloudflare Tunnels daemon (cloudflared) running on your server will access the MQTT broker over localhost:8883. You should verify that if you try to hit this port via the LAN or WAN IP the connection is refused.
+Note: In your firewall settings (whether on the server or part of your network), you should not open port 8883 to the public internet. The Cloudflare Tunnels daemon (`cloudflared`) running on your server will access the MQTT broker over `localhost:8883`. You should verify that if you try to hit this port via the LAN or WAN IP the connection is refused.
 
 ### Option B: Manual Deployment on Linux Server
 
 1. **Clone the repository**
    
    ```bash
-   git clone https://github.com/michaelhart/meshcore-mqtt-broker.git
+   git clone https://github.com/Dhovin/meshcore-mqtt-broker.git
    cd meshcore-mqtt-broker
    ```
 
@@ -87,15 +88,16 @@ Note: In your firewall settings (whether on the server or part of your network),
    nano .env
    ```
    
-   Edit the values:
+   Update the primary settings in `.env` (keep the remaining `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` and `ABUSE_*` variables from `.env.example` intact, and ensure `ABUSE_PERSISTENCE_PATH` points to a writable directory):
    
    ```bash
    MQTT_WS_PORT=8883
    MQTT_HOST=0.0.0.0
    AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
    
-   SUBSCRIBER_1=admin:your-secure-password
-   SUBSCRIBER_2=viewer:another-password
+   SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=2
+   SUBSCRIBER_1=admin:your-secure-password:1:10
+   SUBSCRIBER_2=viewer:another-password:2
    ```
 
 4. **Build and start**
@@ -243,11 +245,13 @@ See the main README for client connection examples.
 - Verify the `aud` claim in your token matches `AUTH_EXPECTED_AUDIENCE`
 - Check that your public key is correctly formatted (64 uppercase hex characters)
 - Ensure your token hasn't expired
+- For subscriber accounts, verify you haven't exceeded `maxConnections` (defaults to `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=2`)
 
 **Publish denied:**
-- Confirm the `origin_id` in your message matches your authenticated public key
-- Verify your topic format is correct: `meshcore/{IATA_CODE}/subtopic`
-- Check that your IATA code is valid (use "test" for testing)
+- Confirm the `origin_id` in your JSON message matches your authenticated public key
+- Verify your topic format is correct: `meshcore/{IATA_CODE}/{PUBLIC_KEY}/{subtopic}`
+- Check that your IATA code is a valid 3-letter uppercase airport code (or `"test"` for testing; `"XXX"` is rejected)
+- Ensure you are not attempting to publish directly to `/internal` (which is reserved for broker-generated telemetry)
 
 ## Multiple Regions
 
@@ -260,4 +264,3 @@ mqtt-ap.yourdomain.com  -> Asia-Pacific broker
 ```
 
 Each broker should have its own `AUTH_EXPECTED_AUDIENCE` value to prevent cross-region token usage.
-

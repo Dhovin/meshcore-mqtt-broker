@@ -32,8 +32,8 @@ Fill out the form fields with the following values:
 | :--- | :--- | :--- |
 | **Name** | `meshcore-mqtt-broker` | Container identifier |
 | **Repository** | `ghcr.io/dhovin/meshcore-mqtt-broker:latest` | GHCR multi-arch Docker image (`amd64`/`arm64`) |
-| **Icon URL** | `https://raw.githubusercontent.com/Dhovin/meshcore-mqtt-broker-docker/main/docs/icon.png` | *(Optional)* Container icon |
-| **WebUI** | `http://[IP]:[PORT:8883]/health` | Health endpoint URL |
+| **Icon URL** | `https://raw.githubusercontent.com/Dhovin/meshcore-mqtt-broker/main/docs/icon.png` | *(Optional)* Container icon |
+| **WebUI** | `http://[IP]:[PORT:8883]/health` | Health endpoint URL (`/health` or `/healthz`) |
 | **Network Type** | `Bridge` | Standard unRAID bridge network |
 
 ---
@@ -48,6 +48,8 @@ Click **+ Add another Port, Variable, Line or Device**:
 - **Container Port**: `8883`
 - **Protocol**: `TCP`
 - Click **Add**.
+
+*(Optional)* If enabling plain TCP MQTT (`ENABLE_TCP_MQTT=true`) for a local Mosquitto bridge, you can also map port `1883` (TCP), restricted to your private LAN/Docker network.
 
 ---
 
@@ -80,35 +82,44 @@ Click **+ Add another Port, Variable, Line or Device** to create each variable r
    - **Key**: `AUTH_EXPECTED_AUDIENCE`
    - **Value**: `mqtt.yourdomain.com` *(Match your external domain or Cloudflare Tunnel endpoint, or leave empty to skip audience validation)*
 
-3. **Subscriber User 1**:
+3. **Default Subscriber Max Connections (Optional)**:
+   - **Config Type**: `Variable`
+   - **Name**: `Default Max Subscriber Connections`
+   - **Key**: `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT`
+   - **Value**: `2`
+
+4. **Subscriber User 1**:
    - **Config Type**: `Variable`
    - **Name**: `Subscriber 1`
    - **Key**: `SUBSCRIBER_1`
-   - **Value**: `viewer1:your-secure-password:2` *(Format: `username:password:role`)*
+   - **Value**: `viewer1:your-secure-password:2` *(Format: `username:password:role:maxConns`, numbered sequentially from `SUBSCRIBER_1`)*
 
-4. **Subscriber User 2 (Admin)**:
+5. **Subscriber User 2 (Admin)**:
    - **Config Type**: `Variable`
    - **Name**: `Subscriber 2`
    - **Key**: `SUBSCRIBER_2`
    - **Value**: `admin:admin-password:1:10` *(Format: `username:password:role:maxConns`)*
 
-5. **MQTT WebSocket Port (Container)**:
+6. **MQTT WebSocket Port (Container)**:
    - **Config Type**: `Variable`
    - **Name**: `MQTT WS Port`
    - **Key**: `MQTT_WS_PORT`
    - **Value**: `8883`
 
-6. **HTTP Browser Redirect URL (Optional)**:
+7. **HTTP Browser Redirect URL (Optional)**:
    - **Config Type**: `Variable`
    - **Name**: `HTTP Redirect URL`
    - **Key**: `HTTP_REDIRECT_URL`
-   - **Value**: *(Leave blank to return 200 OK status on `/`, or set e.g. `https://yourdomain.com`. Note: `/health` always returns 200 OK)*
+   - **Value**: *(Leave blank to return 200 OK status on `/`, or set e.g. `https://yourdomain.com`. Note: `/health` and `/healthz` always return 200 OK)*
 
-7. **Abuse Enforcement (Optional)**:
+8. **Optional Standard TCP MQTT Listener (Optional)**:
+   - **Config Type**: `Variable` | **Name**: `Enable TCP MQTT` | **Key**: `ENABLE_TCP_MQTT` | **Value**: `false` *(Set to `true` to enable plain TCP MQTT on `MQTT_TCP_PORT`, default `1883`)*
+
+9. **Abuse Enforcement (Optional)**:
    - **Config Type**: `Variable`
    - **Name**: `Abuse Enforcement`
    - **Key**: `ABUSE_ENFORCEMENT_ENABLED`
-   - **Value**: `false` *(Set to `true` to enable rate limits)*
+   - **Value**: `false` *(Set to `true` to mark offending clients as `'muted'` in `/internal` trust state)*
 
 ---
 

@@ -44,14 +44,18 @@ services:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
       - MQTT_WS_PORT=${MQTT_WS_PORT:-8883}
+      - ENABLE_TCP_MQTT=${ENABLE_TCP_MQTT:-false}
+      - MQTT_TCP_PORT=${MQTT_TCP_PORT:-1883}
       - MQTT_HOST=0.0.0.0
       - AUTH_EXPECTED_AUDIENCE=${AUTH_EXPECTED_AUDIENCE-}
       - HTTP_REDIRECT_URL=${HTTP_REDIRECT_URL:-}
+      - MQTT_MAX_PACKET_BYTES=${MQTT_MAX_PACKET_BYTES:-65536}
       - SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=${SUBSCRIBER_MAX_CONNECTIONS_DEFAULT:-2}
       - SUBSCRIBER_1=${SUBSCRIBER_1:-viewer1:your-secure-password-here:2}
       - SUBSCRIBER_2=${SUBSCRIBER_2:-admin:admin-password-here:1:10}
       - ABUSE_ENFORCEMENT_ENABLED=${ABUSE_ENFORCEMENT_ENABLED:-false}
       - ABUSE_PERSISTENCE_PATH=/data/abuse-detection.db
+      - ABUSE_STATE_RETENTION_MS=${ABUSE_STATE_RETENTION_MS:-604800000}
     volumes:
       - meshcore_data:/data
     healthcheck:
@@ -72,13 +76,18 @@ Scroll down to the **Environment variables** section in Portainer and click **+ 
 
 | Name | Example Value | Description |
 | :--- | :--- | :--- |
+| `PUID` / `PGID` | `1000` / `1000` | UID / GID for `/data` ownership and non-root execution |
 | `MQTT_WS_PORT` | `8883` | Host and container port for WebSockets |
 | `AUTH_EXPECTED_AUDIENCE` | `mqtt.yourdomain.com` | Expected JWT audience claim (leave empty to skip audience validation) |
-| `SUBSCRIBER_1` | `viewer1:yourpassword:2` | Subscriber user (`user:pass:role`) |
-| `SUBSCRIBER_2` | `admin:adminpassword:1:10` | Subscriber user (`user:pass:role:maxConns`) |
-| `HTTP_REDIRECT_URL` | `https://yourdomain.com` | *(Optional)* Browser redirect URL for `/` (`/health` always returns 200 OK) |
-| `ENABLE_TCP_MQTT` | `false` | Enable/disable standard TCP MQTT on port 1883 (unencrypted — use on private networks/localhost only) |
-| `ABUSE_ENFORCEMENT_ENABLED` | `false` | Enable/disable abuse rate enforcement |
+| `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` | `2` | Default max concurrent connections per subscriber account |
+| `SUBSCRIBER_1` | `viewer1:yourpassword:2` | Subscriber user (`user:pass:role:maxConns`, sequential from `SUBSCRIBER_1`) |
+| `SUBSCRIBER_2` | `admin:adminpassword:1:10` | Admin subscriber user (`1`=Admin, `2`=Full, `3`=Limited) |
+| `HTTP_REDIRECT_URL` | `https://yourdomain.com` | *(Optional)* Browser redirect URL for `/` (`/health` and `/healthz` always return 200 OK) |
+| `ENABLE_TCP_MQTT` | `false` | Enable/disable standard TCP MQTT on `MQTT_TCP_PORT` (default `1883`, unencrypted — use on private networks/localhost only) |
+| `MQTT_TCP_PORT` | `1883` | Port for optional standard TCP MQTT listener |
+| `MQTT_MAX_PACKET_BYTES` | `65536` | Max allowed MQTT publish payload size in bytes (64 KB default) |
+| `ABUSE_ENFORCEMENT_ENABLED` | `false` | When `true`, offending publishers are marked `'muted'` in `/internal` trust state |
+| `ABUSE_STATE_RETENTION_MS` | `604800000` | Idle retention cutoff in ms (default 7 days) before inactive client trust states are evicted |
 
 ### Step 4: Deploy the Stack
 
