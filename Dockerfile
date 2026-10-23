@@ -11,7 +11,8 @@ RUN apk add --no-cache python3 make g++ wget su-exec && \
 COPY package*.json tsconfig.json ./
 
 # Install production dependencies (includes tsx and native dependencies)
-RUN npm ci --omit=dev && \
+# Use --jitless during build to prevent V8 ARM64 JIT SIGILL under QEMU emulation in CI
+RUN NODE_OPTIONS="--jitless" npm ci --omit=dev && \
     apk del python3 make g++
 
 # Copy application source code and entrypoint
