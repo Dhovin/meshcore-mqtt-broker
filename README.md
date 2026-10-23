@@ -40,15 +40,17 @@ services:
     restart: unless-stopped
     ports:
       - "8883:8883"
-      # - "1883:1883" # Uncomment if TCP MQTT is enabled
+      # Plain TCP MQTT is unencrypted; bind to localhost or a private network if enabled:
+      # - "127.0.0.1:1883:1883"
     environment:
       - MQTT_HOST=0.0.0.0
       - MQTT_WS_PORT=8883
+      # Set your expected JWT audience, or leave empty to skip audience validation
       - AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
       # Subscriber accounts format: username:password:role (1=Admin, 2=Full, 3=Limited)
       - SUBSCRIBER_1=admin:your-admin-password:1
       - SUBSCRIBER_2=viewer:your-viewer-password:2
-      # Optional HTTP Browser Redirect URL (leave empty for built-in 200 OK health status)
+      # Optional HTTP Browser Redirect URL for / (leave empty for built-in 200 OK status; /health always returns 200 OK)
       # - HTTP_REDIRECT_URL=https://your-custom-site-or-analyzer.com
       # Optional Standard TCP MQTT listener (for Mosquitto bridges)
       # - ENABLE_TCP_MQTT=true
@@ -161,7 +163,7 @@ MQTT_TCP_PORT=1883
 # Expected audience claim in JWT tokens (leave empty to skip validation)
 AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
 
-# HTTP Web Browser Redirect (Optional - leave blank for 200 OK status fallback)
+# HTTP Web Browser Redirect (Optional - leave blank for 200 OK status fallback; /health always returns 200 OK)
 HTTP_REDIRECT_URL=
 
 # Subscribe-Only Users (read-only monitoring accounts)
@@ -183,6 +185,8 @@ SUBSCRIBER_3=monitor:yet-another-password:3:D
 ## Mosquitto Bridge & Standard TCP MQTT Support
 
 To allow an external Mosquitto server to pull topics from this broker natively over standard TCP MQTT (port 1883), enable the optional TCP listener:
+
+> **Security Warning**: Port `1883` is plain, unencrypted MQTT (no TLS). Subscriber usernames and passwords travel in cleartext over this port. Only expose port `1883` on `localhost` (`127.0.0.1`), an internal Docker network, a private LAN/VPN (e.g., Tailscale/WireGuard), or behind a TLS-terminating proxy. Do not expose raw port `1883` directly to the public internet.
 
 Set environment variables in your `.env` or `docker-compose.yml`:
 ```bash

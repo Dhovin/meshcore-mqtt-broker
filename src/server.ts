@@ -173,6 +173,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         const stream = (client as any).conn;
         if (stream && stream.clientIP) {
           stream.authenticated = true;
+          stream.client = client;
         }
         
         callback(null, true);
@@ -239,6 +240,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     const stream = (client as any).conn;
     if (stream && stream.clientIP) {
       stream.authenticated = true;
+      stream.client = client;
     }
     
     // Initialize abuse detection tracking
@@ -746,6 +748,9 @@ aedes.authorizeForward = (client, packet) => {
 aedes.on('client', (client) => {
   // Link stream to client if available
   (client as any).stream = (client as any).conn;
+  if ((client as any).conn) {
+    ((client as any).conn as any).client = client;
+  }
   
   const logPrefix = getClientLogPrefix(client);
   console.log(`${logPrefix} [CLIENT] Connected`);
@@ -821,6 +826,13 @@ aedes.on('clientError', (client, err) => {
 const httpServer = createServer((req, res) => {
   // If this is not a WebSocket upgrade request, handle standard HTTP request
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
+    const reqPath = (req.url || '/').split('?')[0];
+    if (reqPath === '/health' || reqPath === '/healthz') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'MeshCore MQTT Broker' }));
+      return;
+    }
+
     if (HTTP_REDIRECT_URL) {
       console.log(`[HTTP] Non-WebSocket request from ${getClientIP(req)}, redirecting to ${HTTP_REDIRECT_URL}`);
       res.writeHead(302, { 'Location': HTTP_REDIRECT_URL });
@@ -977,10 +989,43 @@ wsServer.on('connection', (ws, req) => {
 let tcpServer: any = null;
 if (ENABLE_TCP) {
   tcpServer = createTcpServer((socket: any) => {
-    const clientIP = socket.remoteAddress || 'unknown';
+    const rawIP = socket.remoteAddress || 'unknown';
+    const clientIP = rawIP.startsWith('::ffff:') ? rawIP.slice(7) : rawIP;
+
+    // Check if IP is blocked
+    if (rateLimiter.isBlocked(clientIP)) {
+      console.log(`[RATE_LIMIT] Rejecting TCP connection from blocked IP: ${clientIP}`);
+      socket.destroy();
+      return;
+    }
+
     console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
     (socket as any).clientIP = clientIP;
     (socket as any).authenticated = false;
+
+    socket.on('error', (error: Error) => {
+      console.error(`[TCP] Error from ${clientIP}:`, error.message);
+    });
+
+    socket.on('close', () => {
+      const clientInfo = (socket as any).client;
+      const wasAuthenticated = (socket as any).authenticated;
+      const hasValidAuth = clientInfo && (clientInfo as any).clientType;
+
+      if (hasValidAuth) {
+        const logPrefix = getClientLogPrefix(clientInfo);
+        console.log(`${logPrefix} [TCP] Connection closed from ${clientIP}`);
+      } else {
+        console.log(`[C:${clientInfo?.id || 'null'}] [TCP] Connection closed (unauthenticated) from ${clientIP}`);
+        if (!wasAuthenticated) {
+          const blocked = rateLimiter.recordFailure(clientIP);
+          if (blocked) {
+            console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+          }
+        }
+      }
+    });
+
     aedes.handle(socket);
   });
 

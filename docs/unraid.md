@@ -33,7 +33,7 @@ Fill out the form fields with the following values:
 | **Name** | `meshcore-mqtt-broker` | Container identifier |
 | **Repository** | `ghcr.io/dhovin/meshcore-mqtt-broker:latest` | GHCR multi-arch Docker image (`amd64`/`arm64`) |
 | **Icon URL** | `https://raw.githubusercontent.com/Dhovin/meshcore-mqtt-broker-docker/main/docs/icon.png` | *(Optional)* Container icon |
-| **WebUI** | `http://[IP]:[PORT:8883]/` | Health endpoint URL |
+| **WebUI** | `http://[IP]:[PORT:8883]/health` | Health endpoint URL |
 | **Network Type** | `Bridge` | Standard unRAID bridge network |
 
 ---
@@ -70,37 +70,41 @@ Click **+ Add another Port, Variable, Line or Device**:
 
 Click **+ Add another Port, Variable, Line or Device** to create each variable required for your deployment:
 
-1. **Authentication Audience**:
+1. **User / Group IDs (`PUID` & `PGID` for unRAID Appdata Permissions)**:
+   - **Config Type**: `Variable` | **Name**: `PUID` | **Key**: `PUID` | **Value**: `99` *(unRAID `nobody` user)*
+   - **Config Type**: `Variable` | **Name**: `PGID` | **Key**: `PGID` | **Value**: `100` *(unRAID `users` group)*
+
+2. **Authentication Audience**:
    - **Config Type**: `Variable`
    - **Name**: `AUTH_EXPECTED_AUDIENCE`
    - **Key**: `AUTH_EXPECTED_AUDIENCE`
-   - **Value**: `mqtt.yourdomain.com` *(Match your external domain or Cloudflare Tunnel endpoint)*
+   - **Value**: `mqtt.yourdomain.com` *(Match your external domain or Cloudflare Tunnel endpoint, or leave empty to skip audience validation)*
 
-2. **Subscriber User 1**:
+3. **Subscriber User 1**:
    - **Config Type**: `Variable`
    - **Name**: `Subscriber 1`
    - **Key**: `SUBSCRIBER_1`
    - **Value**: `viewer1:your-secure-password:2` *(Format: `username:password:role`)*
 
-3. **Subscriber User 2 (Admin)**:
+4. **Subscriber User 2 (Admin)**:
    - **Config Type**: `Variable`
    - **Name**: `Subscriber 2`
    - **Key**: `SUBSCRIBER_2`
    - **Value**: `admin:admin-password:1:10` *(Format: `username:password:role:maxConns`)*
 
-4. **MQTT WebSocket Port (Container)**:
+5. **MQTT WebSocket Port (Container)**:
    - **Config Type**: `Variable`
    - **Name**: `MQTT WS Port`
    - **Key**: `MQTT_WS_PORT`
    - **Value**: `8883`
 
-5. **HTTP Browser Redirect URL (Optional)**:
+6. **HTTP Browser Redirect URL (Optional)**:
    - **Config Type**: `Variable`
    - **Name**: `HTTP Redirect URL`
    - **Key**: `HTTP_REDIRECT_URL`
-   - **Value**: *(Leave blank to return 200 OK status, or set e.g. `https://yourdomain.com`)*
+   - **Value**: *(Leave blank to return 200 OK status on `/`, or set e.g. `https://yourdomain.com`. Note: `/health` always returns 200 OK)*
 
-6. **Abuse Enforcement (Optional)**:
+7. **Abuse Enforcement (Optional)**:
    - **Config Type**: `Variable`
    - **Name**: `Abuse Enforcement`
    - **Key**: `ABUSE_ENFORCEMENT_ENABLED`
@@ -132,6 +136,8 @@ services:
     ports:
       - "8883:8883"
     environment:
+      - PUID=99
+      - PGID=100
       - MQTT_WS_PORT=8883
       - MQTT_HOST=0.0.0.0
       - AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
@@ -157,4 +163,11 @@ services:
 
 ## Storage & File Permissions
 
-The container runs internally under Node.js user permissions (`node:node`) and stores files under `/mnt/user/appdata/meshcore-mqtt-broker`. Ensure that the `appdata` share has valid read/write permissions for Docker containers.
+The container entrypoint automatically sets ownership of `/data` to `PUID:PGID` (defaults to `1000:1000`, or `99:100` for unRAID's `nobody:users` when `PUID=99` and `PGID=100` are set) before dropping root privileges using `su-exec`.
+
+If you run the container with a custom `--user` flag (which skips the root entrypoint `chown`), make sure the host directory is writable by that UID/GID first from the unRAID terminal:
+
+```bash
+mkdir -p /mnt/user/appdata/meshcore-mqtt-broker
+chown -R 99:100 /mnt/user/appdata/meshcore-mqtt-broker
+```
