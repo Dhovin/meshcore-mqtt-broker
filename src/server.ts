@@ -1,5 +1,6 @@
 import Aedes from 'aedes';
 import { createServer } from 'http';
+import { createServer as createTcpServer } from 'net';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
@@ -17,8 +18,11 @@ const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
 
 const WS_PORT = mqttConfig.wsPort;
+const TCP_PORT = mqttConfig.tcpPort;
+const ENABLE_TCP = mqttConfig.enableTcp;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
+const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
 
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
@@ -171,6 +175,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         const stream = (client as any).conn;
         if (stream && stream.clientIP) {
           stream.authenticated = true;
+          stream.client = client;
         }
         
         callback(null, true);
@@ -237,6 +242,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     const stream = (client as any).conn;
     if (stream && stream.clientIP) {
       stream.authenticated = true;
+      stream.client = client;
     }
     
     // Initialize abuse detection tracking
@@ -756,6 +762,9 @@ aedes.authorizeForward = (client, packet) => {
 aedes.on('client', (client) => {
   // Link stream to client if available
   (client as any).stream = (client as any).conn;
+  if ((client as any).conn) {
+    ((client as any).conn as any).client = client;
+  }
   
   const logPrefix = getClientLogPrefix(client);
   console.log(`${logPrefix} [CLIENT] Connected`);
@@ -838,11 +847,25 @@ const httpServer = createServer((req, res) => {
     return;
   }
 
-  // If this is not a WebSocket upgrade request, redirect to analyzer
+  // If this is not a WebSocket upgrade request, handle standard HTTP request
   if (!req.headers.upgrade || req.headers.upgrade.toLowerCase() !== 'websocket') {
-    console.log(`[HTTP] Non-WebSocket request from ${clientIP}, redirecting to analyzer`);
-    res.writeHead(301, { 'Location': 'https://analyzer.letsmesh.net/' });
-    res.end();
+    const reqPath = (req.url || '/').split('?')[0];
+    if (reqPath === '/health' || reqPath === '/healthz') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', service: 'MeshCore MQTT Broker' }));
+      return;
+    }
+
+    if (HTTP_REDIRECT_URL) {
+      console.log(`[HTTP] Non-WebSocket request from ${clientIP}, redirecting to ${HTTP_REDIRECT_URL}`);
+      res.writeHead(302, { 'Location': HTTP_REDIRECT_URL });
+      res.end();
+      return;
+    }
+
+    console.log(`[HTTP] Non-WebSocket status request from ${clientIP}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', service: 'MeshCore MQTT Broker' }));
     return;
   }
 });
@@ -1017,11 +1040,81 @@ wsServer.on('connection', (ws, req) => {
   }
 });
 
+// Create optional TCP server for raw MQTT connections (e.g. Mosquitto bridge)
+let tcpServer: any = null;
+if (ENABLE_TCP) {
+  tcpServer = createTcpServer((socket: any) => {
+    const rawIP = socket.remoteAddress || 'unknown';
+    const clientIP = rawIP.startsWith('::ffff:') ? rawIP.slice(7) : rawIP;
+
+    // Check if IP is blocked
+    if (rateLimiter.isBlocked(clientIP)) {
+      console.log(`[RATE_LIMIT] Rejecting TCP connection from blocked IP: ${clientIP}`);
+      socket.destroy();
+      return;
+    }
+
+    console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
+    (socket as any).clientIP = clientIP;
+    (socket as any).authenticated = false;
+
+    const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
+    socket.on('data', (chunk: Buffer) => {
+      const valErr = packetValidator.processChunk(chunk);
+      if (valErr) {
+        const clientInfo = (socket as any).client;
+        const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+        console.log(`${logPrefix} [TCP] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
+        socket.destroy();
+      }
+    });
+
+    socket.on('error', (error: Error) => {
+      console.error(`[TCP] Error from ${clientIP}:`, error.message);
+    });
+
+    socket.on('close', () => {
+      const clientInfo = (socket as any).client;
+      const wasAuthenticated = (socket as any).authenticated;
+      const hasValidAuth = clientInfo && (clientInfo as any).clientType;
+
+      if (hasValidAuth) {
+        const logPrefix = getClientLogPrefix(clientInfo);
+        console.log(`${logPrefix} [TCP] Connection closed from ${clientIP}`);
+      } else {
+        console.log(`[C:${clientInfo?.id || 'null'}] [TCP] Connection closed (unauthenticated) from ${clientIP}`);
+        if (!wasAuthenticated) {
+          const blocked = rateLimiter.recordFailure(clientIP);
+          if (blocked) {
+            console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+          }
+        }
+      }
+    });
+
+    aedes.handle(socket);
+  });
+
+  tcpServer.listen(TCP_PORT, HOST, () => {
+    console.log(`TCP MQTT listening on:       mqtt://${HOST}:${TCP_PORT}`);
+  });
+}
+
 httpServer.listen(WS_PORT, HOST, () => {
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker (WebSocket)                  ║');
+  console.log('║         MeshCore MQTT Broker                               ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
+  if (ENABLE_TCP) {
+    console.log(`Standard TCP MQTT listening on: mqtt://${HOST}:${TCP_PORT}`);
+  } else {
+    console.log('Standard TCP MQTT:          Disabled (ENABLE_TCP_MQTT=false)');
+  }
+  if (HTTP_REDIRECT_URL) {
+    console.log(`HTTP Browser Redirect:      ${HTTP_REDIRECT_URL}`);
+  } else {
+    console.log('HTTP Browser Redirect:      Disabled (serving 200 OK status)');
+  }
   console.log('');
   console.log('Authentication Modes:');
   console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
@@ -1045,6 +1138,10 @@ function shutdown(): void {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  if (tcpServer) {
+    tcpServer.close();
+  }
+  httpServer.close();
   rateLimiter.destroy();
   abuseDetector.shutdown();
   aedes.close(() => {
