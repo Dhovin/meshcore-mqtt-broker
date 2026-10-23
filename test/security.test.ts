@@ -1,9 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { Duplex } from 'stream';
-import { timingSafeCompare } from '../src/crypto-utils';
-import { RateLimiter } from '../src/rate-limiter';
-import { MqttStreamValidator } from '../src/mqtt-packet-validator';
+import { timingSafeCompare } from '../src/crypto-utils.js';
+import { RateLimiter } from '../src/rate-limiter.js';
+import { MqttStreamValidator } from '../src/mqtt-packet-validator.js';
+import { AbuseDetector } from '../src/abuse-detector.js';
+import { join } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 describe('Security: Timing-Safe Password Comparison', () => {
   it('returns true for matching passwords', () => {
@@ -207,5 +211,158 @@ describe('Security: WebSocket Backpressure Handling', () => {
     // Simulate stream read
     stream.read(0);
     assert.strictEqual(resumed, true);
+  });
+});
+
+
+describe('AbuseDetector: Built-in node:sqlite Persistence', () => {
+  it('persists and reloads client trust state across restarts', () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-sqlite-test-'));
+    const dbPath = join(tempDir, 'abuse.db');
+    const config = {
+      duplicateWindowSize: 100,
+      duplicateWindowMs: 300000,
+      duplicateThreshold: 10,
+      maxDuplicatesPerPacket: 5,
+      duplicateRateThreshold: 0.3,
+      duplicateRateWindowMs: 300000,
+      bucketCapacity: 20,
+      bucketRefillRate: 3,
+      maxPacketSize: 255,
+      maxTopicsPerDay: 3,
+      anomalyThreshold: 10,
+      maxIataChanges24h: 3,
+      topicHistorySize: 50,
+      topicHistoryWindowMs: 86400000,
+      persistencePath: dbPath,
+      persistenceIntervalMs: 300000,
+      stateRetentionMs: 604800000,
+      enforcementEnabled: false,
+    };
+
+    try {
+      const pubKey = 'A'.repeat(64);
+      const detector1 = new AbuseDetector(config);
+      detector1.initializeClient(pubKey, `v1_${pubKey}`, '198.51.100.1');
+      detector1.shutdown();
+
+      const detector2 = new AbuseDetector(config);
+      const state = detector2.getClientStats(pubKey);
+      assert.ok(state, 'Expected persisted client trust state to be reloaded');
+      assert.strictEqual(state?.publicKey, pubKey);
+      assert.strictEqual(state?.recentIPs[0]?.ip, '198.51.100.1');
+      detector2.shutdown();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { getAirportInfo } from 'airport-utils';
+
+describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
+  it('validates IATA airport codes with updated airport-utils', () => {
+    const sea = getAirportInfo('SEA');
+    assert.ok(sea);
+    assert.throws(() => getAirportInfo('ZZZ'));
+  });
+
+  it('starts compiled dist/server.js, serves /health, and authenticates MQTT over TCP', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-e2e-test-'));
+    const dbPath = join(tempDir, 'abuse.db');
+    const wsPort = 18883;
+    const tcpPort = 11883;
+
+    const child = spawn(process.execPath, ['dist/server.js'], {
+      env: {
+        ...process.env,
+        MQTT_WS_PORT: String(wsPort),
+        MQTT_TCP_PORT: String(tcpPort),
+        ENABLE_TCP_MQTT: 'true',
+        MQTT_HOST: '127.0.0.1',
+        AUTH_EXPECTED_AUDIENCE: 'test.local',
+        HTTP_REDIRECT_URL: '',
+        MQTT_MAX_PACKET_BYTES: '65536',
+        SUBSCRIBER_MAX_CONNECTIONS_DEFAULT: '2',
+        SUBSCRIBER_1: 'admin:testpass123:1:2',
+        ABUSE_ENFORCEMENT_ENABLED: 'false',
+        ABUSE_DUPLICATE_WINDOW_SIZE: '100',
+        ABUSE_DUPLICATE_WINDOW_MS: '300000',
+        ABUSE_DUPLICATE_THRESHOLD: '10',
+        ABUSE_MAX_DUPLICATES_PER_PACKET: '5',
+        ABUSE_DUPLICATE_RATE_THRESHOLD: '0.3',
+        ABUSE_DUPLICATE_RATE_WINDOW_MS: '300000',
+        ABUSE_BUCKET_CAPACITY: '20',
+        ABUSE_BUCKET_REFILL_RATE: '3',
+        ABUSE_MAX_PACKET_SIZE: '255',
+        ABUSE_MAX_TOPICS_PER_DAY: '3',
+        ABUSE_ANOMALY_THRESHOLD: '10',
+        ABUSE_MAX_IATA_CHANGES_24H: '3',
+        ABUSE_TOPIC_HISTORY_SIZE: '50',
+        ABUSE_TOPIC_HISTORY_WINDOW_MS: '86400000',
+        ABUSE_PERSISTENCE_PATH: dbPath,
+        ABUSE_PERSISTENCE_INTERVAL_MS: '300000',
+        ABUSE_STATE_RETENTION_MS: '604800000',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    try {
+      // Wait for broker to print listening message
+      await new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Broker startup timed out')), 5000);
+        let output = '';
+        child.stdout.on('data', (chunk) => {
+          output += chunk.toString();
+          if (output.includes('Ready to accept connections') && output.includes('TCP MQTT listening on')) {
+            clearTimeout(timeout);
+            resolve();
+          }
+        });
+        child.stderr.on('data', (chunk) => {
+          output += chunk.toString();
+        });
+        child.on('exit', (code) => {
+          clearTimeout(timeout);
+          reject(new Error(`Broker exited prematurely with code ${code}: ${output}`));
+        });
+      });
+
+      // 1. Verify /health endpoint returns 200 OK
+      const healthRes = await fetch(`http://127.0.0.1:${wsPort}/health`);
+      assert.strictEqual(healthRes.status, 200);
+      assert.strictEqual(await healthRes.text(), '{"status":"ok","service":"MeshCore MQTT Broker"}');
+
+      // 2. Verify MQTT TCP connection with valid subscriber credentials
+      const connackCode = await new Promise<number>((resolve, reject) => {
+        const socket = createConnection({ host: '127.0.0.1', port: tcpPort }, () => {
+          // Build MQTT 3.1.1 CONNECT packet with username="admin", password="testpass123"
+          const vh = Buffer.from([
+            0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, // Protocol Name "MQTT"
+            0x04,                               // Protocol Level 4 (3.1.1)
+            0xc2,                               // Connect Flags: Username + Password + CleanSession
+            0x00, 0x3c,                         // Keep Alive 60s
+          ]);
+          const clientId = Buffer.from([0x00, 0x07, ...Buffer.from('testsub')]);
+          const user = Buffer.from([0x00, 0x05, ...Buffer.from('admin')]);
+          const pass = Buffer.from([0x00, 0x0b, ...Buffer.from('testpass123')]);
+          const body = Buffer.concat([vh, clientId, user, pass]);
+          const packet = Buffer.concat([Buffer.from([0x10, body.length]), body]);
+          socket.write(packet);
+        });
+        socket.on('data', (data) => {
+          socket.destroy();
+          resolve(data[3]); // CONNACK return code byte
+        });
+        socket.on('error', reject);
+      });
+      assert.strictEqual(connackCode, 0x00, 'Expected CONNACK 0x00 (Connection Accepted)');
+    } finally {
+      child.kill();
+      await new Promise((resolve) => child.once('exit', resolve));
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

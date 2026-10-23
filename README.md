@@ -316,7 +316,7 @@ remote_password your-subscriber-password
 
 ## Local Development & Testing (Without Docker)
 
-Requires **Node.js 22+**.
+Requires **Node.js 24+**.
 
 ```bash
 # 1. Install dependencies
@@ -334,7 +334,7 @@ npm run build
 # 5. Start the server (via tsx)
 npm start
 
-# Or run in development mode (via ts-node/esm):
+# Or run in development watch mode (via tsx watch):
 npm run dev
 ```
 

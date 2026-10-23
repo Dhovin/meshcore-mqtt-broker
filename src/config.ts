@@ -1,5 +1,5 @@
 import { config as dotenvConfig } from 'dotenv';
-import { AbuseConfig } from './abuse-detector';
+import { AbuseConfig } from './abuse-detector.js';
 
 // Load environment variables
 dotenvConfig();

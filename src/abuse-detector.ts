@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 
 // Cap the per-client anomaly log. Without a bound, chronically noisy clients
 // accumulate multi-MB logs that the synchronous 5-minute save cycle must
@@ -213,7 +213,7 @@ interface SerializedTrustState {
 export class AbuseDetector {
   private config: AbuseConfig;
   private clients: Map<string, ClientTrustState> = new Map();
-  private db: Database.Database;
+  private db: DatabaseSync;
   private persistenceInterval?: NodeJS.Timeout;
   
   // Global stats
@@ -227,7 +227,7 @@ export class AbuseDetector {
     this.config = config;
     
     // Initialize SQLite database
-    this.db = new Database(config.persistencePath);
+    this.db = new DatabaseSync(config.persistencePath);
     this.initDatabase();
     this.loadFromDatabase();
     
@@ -260,7 +260,7 @@ export class AbuseDetector {
     const stmt = this.db.prepare('SELECT public_key, state_json FROM trust_states WHERE updated_at >= ?');
 
     let loaded = 0;
-    for (const row of stmt.iterate(cutoff) as Iterable<{ public_key: string; state_json: string }>) {
+    for (const row of stmt.iterate(cutoff) as unknown as Iterable<{ public_key: string; state_json: string }>) {
       try {
         const serialized: SerializedTrustState = JSON.parse(row.state_json);
         const state = this.deserializeTrustState(serialized);

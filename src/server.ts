@@ -5,12 +5,12 @@ import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
-import { RateLimiter } from './rate-limiter';
-import { getClientIP } from './ip-utils';
-import { AbuseDetector } from './abuse-detector';
-import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
-import { timingSafeCompare } from './crypto-utils';
-import { MqttStreamValidator } from './mqtt-packet-validator';
+import { RateLimiter } from './rate-limiter.js';
+import { getClientIP } from './ip-utils.js';
+import { AbuseDetector } from './abuse-detector.js';
+import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config.js';
+import { timingSafeCompare } from './crypto-utils.js';
+import { MqttStreamValidator } from './mqtt-packet-validator.js';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();

@@ -1,22 +1,23 @@
 # Dockerfile for MeshCore MQTT Broker
-FROM node:22-alpine
+FROM node:24-alpine
 
 WORKDIR /app
 
-# Install build tools for native C++ extensions (better-sqlite3) and runtime utilities
-RUN apk add --no-cache python3 make g++ wget su-exec && \
+# Install runtime utilities (wget for healthcheck, su-exec for PUID/PGID privilege drop)
+RUN apk add --no-cache wget su-exec && \
     mkdir -p /data
 
-# Copy package manifests
+# Copy package manifests and application source code
 COPY package*.json tsconfig.json ./
-
-# Install production dependencies (includes tsx and native dependencies)
-# Use --jitless during build to prevent V8 ARM64 JIT SIGILL under QEMU emulation in CI
-RUN NODE_OPTIONS="--jitless" npm ci --omit=dev && \
-    apk del python3 make g++
-
-# Copy application source code and entrypoint
 COPY src/ ./src/
+
+# Install dependencies, compile TypeScript to dist/, and prune devDependencies
+# Use --jitless during build to prevent V8 ARM64 JIT SIGILL under QEMU emulation in CI
+RUN NODE_OPTIONS="--jitless" npm ci && \
+    NODE_OPTIONS="--jitless" npm run build && \
+    NODE_OPTIONS="--jitless" npm prune --omit=dev
+
+# Copy entrypoint script
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # Environment variable defaults
@@ -61,4 +62,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget --no-verbose --tries=1 --max-redirect=0 --spider http://127.0.0.1:${MQTT_WS_PORT:-8883}/health || exit 1
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["npx", "tsx", "src/server.ts"]
+CMD ["node", "dist/server.js"]
