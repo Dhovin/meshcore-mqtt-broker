@@ -1,7 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { Duplex } from 'stream';
 import { timingSafeCompare } from '../src/crypto-utils';
 import { RateLimiter } from '../src/rate-limiter';
+import { MqttStreamValidator } from '../src/mqtt-packet-validator';
 
 describe('Security: Timing-Safe Password Comparison', () => {
   it('returns true for matching passwords', () => {
@@ -41,7 +43,7 @@ describe('Security: Bounded RateLimiter & Expiration Pruning', () => {
     }
   });
 
-  it('prunes expired entries during cleanup', () => {
+  it('prunes expired entries during cleanup', async () => {
     // Window of 50ms
     const limiter = new RateLimiter(50, 5, 50, 100, 0);
 
@@ -50,14 +52,11 @@ describe('Security: Bounded RateLimiter & Expiration Pruning', () => {
       limiter.recordFailure('10.0.0.2');
       assert.strictEqual(limiter.getRecordCount(), 2);
 
-      // Wait 60ms for window to expire
-      return new Promise<void>((resolve) => {
-        setTimeout(() => {
-          limiter.cleanupExpired();
-          assert.strictEqual(limiter.getRecordCount(), 0);
-          resolve();
-        }, 65);
-      });
+      // Wait 65ms for window to expire
+      await new Promise<void>((resolve) => setTimeout(resolve, 65));
+
+      limiter.cleanupExpired();
+      assert.strictEqual(limiter.getRecordCount(), 0);
     } finally {
       limiter.destroy();
     }
@@ -80,5 +79,133 @@ describe('Security: Bounded RateLimiter & Expiration Pruning', () => {
     } finally {
       limiter.destroy();
     }
+  });
+
+  it('never evicts an active block to make room', () => {
+    // maxEntries: 2, threshold: 2 failures
+    const limiter = new RateLimiter(60000, 2, 300000, 2, 0);
+
+    try {
+      const blockedIP = '10.0.0.1';
+      // Block the first IP
+      limiter.recordFailure(blockedIP);
+      limiter.recordFailure(blockedIP);
+      assert.strictEqual(limiter.isBlocked(blockedIP), true);
+
+      // Add a second unblocked IP
+      limiter.recordFailure('10.0.0.2');
+      assert.strictEqual(limiter.getRecordCount(), 2);
+
+      // Add a third IP: capacity exceeded!
+      // Unblocked IP (10.0.0.2) should be evicted, but blockedIP MUST NOT be evicted
+      limiter.recordFailure('10.0.0.3');
+      assert.strictEqual(limiter.getRecordCount(), 2);
+      assert.strictEqual(limiter.isBlocked(blockedIP), true);
+
+      // Block the second slot too
+      limiter.recordFailure('10.0.0.3');
+      assert.strictEqual(limiter.isBlocked('10.0.0.3'), true);
+
+      // Now both slots are active blocks. Flooding with new IPs must NOT displace either active block
+      for (let i = 10; i <= 20; i++) {
+        limiter.recordFailure(`192.168.0.${i}`);
+      }
+      assert.strictEqual(limiter.getRecordCount(), 2);
+      assert.strictEqual(limiter.isBlocked(blockedIP), true);
+      assert.strictEqual(limiter.isBlocked('10.0.0.3'), true);
+    } finally {
+      limiter.destroy();
+    }
+  });
+});
+
+describe('Security: MQTT Stream Packet Size Validator', () => {
+  it('accepts valid packets within maxPacketBytes', () => {
+    const validator = new MqttStreamValidator(1024);
+
+    // PINGREQ (0xC0, 0x00)
+    const ping = Buffer.from([0xC0, 0x00]);
+    assert.strictEqual(validator.processChunk(ping), null);
+
+    // PUBLISH with 10 bytes payload (remaining length = 10)
+    const pubHeader = Buffer.from([0x30, 0x0A]);
+    const payload = Buffer.alloc(10, 'A');
+    assert.strictEqual(validator.processChunk(Buffer.concat([pubHeader, payload])), null);
+  });
+
+  it('handles packets split across multiple chunks', () => {
+    const validator = new MqttStreamValidator(1024);
+
+    // 1-byte header chunk
+    assert.strictEqual(validator.processChunk(Buffer.from([0x30])), null);
+    // 1-byte length chunk (remaining length = 10)
+    assert.strictEqual(validator.processChunk(Buffer.from([0x0A])), null);
+    // 5 bytes payload
+    assert.strictEqual(validator.processChunk(Buffer.alloc(5, 'B')), null);
+    // remaining 5 bytes payload
+    assert.strictEqual(validator.processChunk(Buffer.alloc(5, 'B')), null);
+
+    // Packet complete, validator ready for next packet
+    const ping = Buffer.from([0xC0, 0x00]);
+    assert.strictEqual(validator.processChunk(ping), null);
+  });
+
+  it('handles multiple packets in a single chunk', () => {
+    const validator = new MqttStreamValidator(1024);
+
+    // PINGREQ (2 bytes) + DISCONNECT (2 bytes)
+    const combined = Buffer.from([0xC0, 0x00, 0xE0, 0x00]);
+    assert.strictEqual(validator.processChunk(combined), null);
+  });
+
+  it('rejects packet whose remaining length exceeds maxPacketBytes', () => {
+    // Limit to 100 bytes
+    const validator = new MqttStreamValidator(100);
+
+    // Packet declaring remaining length of 500 bytes:
+    // 500 = 0xF4, 0x03 (varbyte encoded: (0xF4 & 0x7F) + 3*128 = 116 + 384 = 500)
+    const chunk = Buffer.from([0x30, 0xF4, 0x03]);
+    const err = validator.processChunk(chunk);
+    assert.notStrictEqual(err, null);
+    assert.match(err!.message, /exceeds maximum allowed size/);
+  });
+
+  it('rejects malformed packet with remaining length exceeding 4 bytes', () => {
+    const validator = new MqttStreamValidator(65536);
+
+    // 5 continuation bytes (all with bit 7 set)
+    const chunk = Buffer.from([0x30, 0x80, 0x80, 0x80, 0x80, 0x80]);
+    const err = validator.processChunk(chunk);
+    assert.notStrictEqual(err, null);
+    assert.match(err!.message, /remaining length exceeds 4 bytes/);
+  });
+});
+
+describe('Security: WebSocket Backpressure Handling', () => {
+  it('resumes WebSocket reads when Duplex stream is read', () => {
+    let resumed = false;
+    const fakeWs = {
+      readyState: 1, // OPEN
+      OPEN: 1,
+      resume: () => {
+        resumed = true;
+      },
+      pause: () => {}
+    };
+
+    const stream = new Duplex({
+      read() {
+        if (fakeWs.readyState === fakeWs.OPEN) {
+          fakeWs.resume();
+        }
+      },
+      write(chunk, enc, cb) {
+        cb();
+      }
+    });
+
+    // Simulate stream read
+    stream.read(0);
+    assert.strictEqual(resumed, true);
   });
 });

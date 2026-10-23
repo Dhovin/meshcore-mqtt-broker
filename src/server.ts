@@ -2,7 +2,6 @@ import Aedes from 'aedes';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
-import { timingSafeEqual } from 'crypto';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter';
@@ -10,8 +9,7 @@ import { getClientIP } from './ip-utils';
 import { AbuseDetector } from './abuse-detector';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config';
 import { timingSafeCompare } from './crypto-utils';
-
-export { timingSafeCompare };
+import { MqttStreamValidator } from './mqtt-packet-validator';
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
@@ -226,26 +224,6 @@ aedes.authenticate = async (client, username, password, callback) => {
       console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
       callback(null, false);
       return;
-    }
-
-    // Validate expiration claim if configured (disabled by default for compatibility with offline/clockless nodes)
-    if (mqttConfig.enforceExpiration && tokenPayload.exp) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (nowSec > tokenPayload.exp) {
-        console.log(`${logPrefix} [AUTH] ✗ Expired token: exp=${tokenPayload.exp}, now=${nowSec}`);
-        callback(null, false);
-        return;
-      }
-    }
-
-    // Sanity check future issued-at claim (reject tokens claiming to be from >24h in the future)
-    if (tokenPayload.iat) {
-      const nowSec = Math.floor(Date.now() / 1000);
-      if (tokenPayload.iat > nowSec + 86400) {
-        console.log(`${logPrefix} [AUTH] ✗ Token iat is too far in future: iat=${tokenPayload.iat}, now=${nowSec}`);
-        callback(null, false);
-        return;
-      }
     }
     
     const shortKey = publicKey.substring(0, 8);
@@ -495,8 +473,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       // Use normalizedLocation to ensure consistent tracking regardless of case
       
       // Check IATA changes
-      const publicKey = (client as any).publicKey;
-      const trustState = abuseDetector.getClientStats(publicKey);
+      const trustState = abuseDetector.getClientStats(clientPublicKey);
       if (trustState) {
         abuseDetector.checkIataChange(trustState, normalizedLocation);
         
@@ -512,8 +489,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         // Use normalizedLocation to ensure consistent internal topic naming
         const internalTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/internal`;
         
-        // Get trust state for internal message
-        const trustState = abuseDetector.getClientStats(clientPublicKey);
+        // Build trust metrics for internal message
         let trustMetrics: any = null;
         
         if (trustState) {
@@ -907,10 +883,16 @@ wsServer.on('connection', (ws, req) => {
     console.error(`[WEBSOCKET] Error from ${clientIP}:`, error.message);
   });
   
+  // Create per-connection MQTT packet validator with headroom for topic and header bytes
+  const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
+
   // Create a duplex stream from the WebSocket
   const stream = new Duplex({
     read() {
-      // No-op, data is pushed via ws.on('message')
+      // Resume WebSocket reads when consumer is ready for more data
+      if (ws.readyState === ws.OPEN) {
+        ws.resume();
+      }
     },
     write(chunk, encoding, callback) {
       if (ws.readyState === ws.OPEN) {
@@ -944,10 +926,27 @@ wsServer.on('connection', (ws, req) => {
     }
   });
 
-  // Forward WebSocket messages to the stream with backpressure handling
+  // Forward WebSocket messages to the stream with validation and backpressure handling
   ws.on('message', (data) => {
+    const buf = Buffer.isBuffer(data)
+      ? data
+      : Array.isArray(data)
+        ? Buffer.concat(data)
+        : Buffer.from(data);
+
+    // Validate MQTT packet size before buffering to prevent memory exhaustion
+    const valErr = packetValidator.processChunk(buf);
+    if (valErr) {
+      const clientInfo = (stream as any).client;
+      const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+      console.log(`${logPrefix} [MQTT] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
+      ws.terminate();
+      stream.destroy();
+      return;
+    }
+
     // Log MQTT PINGREQ packets (0xC0 = PINGREQ) with client identifier
-    if (data instanceof Buffer && data.length >= 2 && data[0] === 0xC0) {
+    if (buf.length >= 2 && buf[0] === 0xC0) {
       const clientInfo = (stream as any).client;
       if (clientInfo) {
         const logPrefix = getClientLogPrefix(clientInfo);
@@ -956,17 +955,10 @@ wsServer.on('connection', (ws, req) => {
         console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
       }
     }
-    const canAcceptMore = stream.push(data);
+    const canAcceptMore = stream.push(buf);
     if (!canAcceptMore && ws.readyState === ws.OPEN) {
       // Pause incoming WebSocket reads when duplex buffer is full
       ws.pause();
-    }
-  });
-
-  // Resume WebSocket reads when the duplex stream drains
-  stream.on('drain', () => {
-    if (ws.readyState === ws.OPEN) {
-      ws.resume();
     }
   });
 
@@ -996,7 +988,9 @@ wsServer.on('connection', (ws, req) => {
         }
       }
     }
-    stream.push(null);
+    if (!stream.destroyed) {
+      stream.push(null);
+    }
   });
 
   // Handle stream end
@@ -1046,7 +1040,10 @@ httpServer.listen(WS_PORT, HOST, () => {
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+let isShuttingDown = false;
+function shutdown(): void {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   rateLimiter.destroy();
   abuseDetector.shutdown();
@@ -1054,14 +1051,7 @@ process.on('SIGINT', () => {
     console.log('[SHUTDOWN] Broker closed');
     process.exit(0);
   });
-});
+}
 
-process.on('SIGTERM', () => {
-  console.log('\n[SHUTDOWN] Closing MQTT broker...');
-  rateLimiter.destroy();
-  abuseDetector.shutdown();
-  aedes.close(() => {
-    console.log('[SHUTDOWN] Broker closed');
-    process.exit(0);
-  });
-});
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

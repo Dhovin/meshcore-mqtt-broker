@@ -18,10 +18,10 @@ export class RateLimiter {
   private cleanupInterval?: NodeJS.Timeout;
 
   constructor(
-    windowMs: number = 60000,        // 1 minute
+    windowMs: number = 60000,          // 1 minute
     maxFailedConnections: number = 10,
-    blockDurationMs: number = 300000, // 5 minutes
-    maxEntries: number = 10000,      // Bound map size to prevent memory exhaustion
+    blockDurationMs: number = 300000,   // 5 minutes
+    maxEntries: number = 10000,        // Bound map size to prevent memory exhaustion
     cleanupIntervalMs: number = 300000 // Clean up expired records every 5 minutes
   ) {
     this.windowMs = windowMs;
@@ -41,18 +41,52 @@ export class RateLimiter {
   }
 
   /**
+   * Check whether a record's active block or failure tracking window has expired
+   */
+  private isRecordExpired(rec: RateLimitRecord, now: number): boolean {
+    if (rec.blockedUntil) {
+      return now >= rec.blockedUntil;
+    }
+    return now - rec.firstFailure > this.windowMs;
+  }
+
+  /**
    * Prune expired failure and block records from memory
    */
   public cleanupExpired(): void {
     const now = Date.now();
     for (const [ip, record] of this.failedConnectionsByIP.entries()) {
-      const isBlockExpired = !record.blockedUntil || now >= record.blockedUntil;
-      const isWindowExpired = now - record.firstFailure > this.windowMs;
-
-      if (isBlockExpired && isWindowExpired) {
+      if (this.isRecordExpired(record, now)) {
         this.failedConnectionsByIP.delete(ip);
       }
     }
+  }
+
+  /**
+   * Evict an entry to maintain capacity:
+   * 1. Evict expired entries first.
+   * 2. Evict the oldest unblocked entry.
+   * 3. Never evict active blocks to make room.
+   */
+  private evictEntry(now: number): boolean {
+    // 1. Evict expired entries first
+    for (const [ip, rec] of this.failedConnectionsByIP.entries()) {
+      if (this.isRecordExpired(rec, now)) {
+        this.failedConnectionsByIP.delete(ip);
+        return true;
+      }
+    }
+
+    // 2. Evict oldest unblocked entry
+    for (const [ip, rec] of this.failedConnectionsByIP.entries()) {
+      if (!rec.blockedUntil) {
+        this.failedConnectionsByIP.delete(ip);
+        return true;
+      }
+    }
+
+    // 3. Never evict active blocks to make room
+    return false;
   }
 
   /**
@@ -62,17 +96,13 @@ export class RateLimiter {
     const record = this.failedConnectionsByIP.get(ip);
     if (!record) return false;
 
-    if (record.blockedUntil && Date.now() < record.blockedUntil) {
-      return true;
-    }
-
-    // Reset if window expired
-    if (Date.now() - record.firstFailure > this.windowMs) {
+    const now = Date.now();
+    if (this.isRecordExpired(record, now)) {
       this.failedConnectionsByIP.delete(ip);
       return false;
     }
 
-    return false;
+    return Boolean(record.blockedUntil && now < record.blockedUntil);
   }
 
   /**
@@ -86,9 +116,10 @@ export class RateLimiter {
     if (!record) {
       // Enforce max capacity to prevent memory exhaustion attacks
       if (this.failedConnectionsByIP.size >= this.maxEntries) {
-        const oldestKey = this.failedConnectionsByIP.keys().next().value;
-        if (oldestKey) {
-          this.failedConnectionsByIP.delete(oldestKey);
+        const evicted = this.evictEntry(now);
+        // If all entries are actively blocked, do not displace them
+        if (!evicted) {
+          return false;
         }
       }
 
@@ -96,13 +127,18 @@ export class RateLimiter {
       return false;
     }
 
-    // Reset if window expired
-    if (now - record.firstFailure > this.windowMs) {
+    // Reset if previous window or block has expired
+    if (this.isRecordExpired(record, now)) {
+      this.failedConnectionsByIP.delete(ip);
       this.failedConnectionsByIP.set(ip, { count: 1, firstFailure: now });
       return false;
     }
 
     record.count++;
+
+    // Refresh insertion order so recently failed IPs are kept over idle ones
+    this.failedConnectionsByIP.delete(ip);
+    this.failedConnectionsByIP.set(ip, record);
 
     // Block if threshold exceeded
     if (record.count >= this.maxFailedConnections && !record.blockedUntil) {

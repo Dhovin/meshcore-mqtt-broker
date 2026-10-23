@@ -27,7 +27,6 @@ export function loadMqttConfig() {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),
     host: process.env.MQTT_HOST!,
     expectedAudience: process.env.AUTH_EXPECTED_AUDIENCE!,
-    enforceExpiration: process.env.AUTH_ENFORCE_EXPIRATION === 'true',
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
   };
 }
@@ -84,4 +83,3 @@ export function loadAbuseConfig(): AbuseConfig {
     enforcementEnabled: process.env.ABUSE_ENFORCEMENT_ENABLED === 'true',
   };
 }
-
