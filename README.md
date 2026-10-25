@@ -381,7 +381,7 @@ remote_password your-subscriber-password
 
 ## Local Development & Testing (Without Docker)
 
-Requires **Node.js 24+**.
+Requires **Node.js 24.22.1+**.
 
 ```bash
 # 1. Install dependencies

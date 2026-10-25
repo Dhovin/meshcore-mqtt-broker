@@ -1167,9 +1167,12 @@ if (ENABLE_TCP) {
 sysMetrics.start();
 
 httpServer.listen(WS_PORT, HOST, () => {
+  const aedesVer = (aedes as any).version || '0.51.3';
+  const bannerTitle = `MeshCore MQTT Broker v${brokerVersion}`.padEnd(51, ' ');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker                               ║');
+  console.log(`║         ${bannerTitle}║`);
   console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log(`Runtime Environment:        Node.js ${process.version} (${process.platform}/${process.arch}, aedes v${aedesVer})`);
   console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
   if (ENABLE_TCP) {
     console.log(`Standard TCP MQTT listening on: mqtt://${HOST}:${TCP_PORT}`);

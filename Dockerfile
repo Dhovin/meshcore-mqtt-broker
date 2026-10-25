@@ -11,9 +11,10 @@ RUN apk add --no-cache wget su-exec && \
 COPY package*.json tsconfig.json ./
 COPY src/ ./src/
 
-# Install dependencies, compile TypeScript to dist/, and prune devDependencies
+# Install dependencies (enforcing engines.node >=24.22.1), compile TypeScript to dist/, and prune devDependencies
 # Use --jitless during build to prevent V8 ARM64 JIT SIGILL under QEMU emulation in CI
-RUN NODE_OPTIONS="--jitless" npm ci && \
+RUN node -v && \
+    NODE_OPTIONS="--jitless" npm ci --engine-strict && \
     NODE_OPTIONS="--jitless" npm run build && \
     NODE_OPTIONS="--jitless" npm prune --omit=dev
 

@@ -440,7 +440,11 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
         let output = '';
         child.stdout.on('data', (chunk) => {
           output += chunk.toString();
-          if (output.includes('Ready to accept connections') && output.includes('TCP MQTT listening on')) {
+          if (
+            output.includes('Ready to accept connections') &&
+            output.includes('TCP MQTT listening on') &&
+            output.includes('Runtime Environment:        Node.js ')
+          ) {
             clearTimeout(timeout);
             resolve();
           }
