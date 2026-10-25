@@ -50,6 +50,7 @@ services:
       - AUTH_EXPECTED_AUDIENCE=${AUTH_EXPECTED_AUDIENCE-}
       - HTTP_REDIRECT_URL=${HTTP_REDIRECT_URL:-}
       - MQTT_MAX_PACKET_BYTES=${MQTT_MAX_PACKET_BYTES:-65536}
+      - MQTT_SYS_INTERVAL_MS=${MQTT_SYS_INTERVAL_MS:-10000}
       - SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=${SUBSCRIBER_MAX_CONNECTIONS_DEFAULT:-2}
       - SUBSCRIBER_1=${SUBSCRIBER_1:-viewer1:your-secure-password-here:2}
       - SUBSCRIBER_2=${SUBSCRIBER_2:-admin:admin-password-here:1:10}
@@ -86,6 +87,7 @@ Scroll down to the **Environment variables** section in Portainer and click **+ 
 | `ENABLE_TCP_MQTT` | `false` | Enable/disable standard TCP MQTT on `MQTT_TCP_PORT` (default `1883`, unencrypted — use on private networks/localhost only) |
 | `MQTT_TCP_PORT` | `1883` | Port for optional standard TCP MQTT listener |
 | `MQTT_MAX_PACKET_BYTES` | `65536` | Max allowed MQTT publish payload size in bytes (64 KB default) |
+| `MQTT_SYS_INTERVAL_MS` | `10000` | Interval in ms between retained `$SYS/broker/#` telemetry updates for Admin subscribers (default 10s) |
 | `ABUSE_ENFORCEMENT_ENABLED` | `false` | When `true`, offending publishers are marked `'muted'` in `/internal` trust state |
 | `ABUSE_STATE_RETENTION_MS` | `604800000` | Idle retention cutoff in ms (default 7 days) before inactive client trust states are evicted |
 

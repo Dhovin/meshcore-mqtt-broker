@@ -31,6 +31,7 @@ export function loadMqttConfig() {
     expectedAudience: process.env.AUTH_EXPECTED_AUDIENCE!,
     httpRedirectUrl: process.env.HTTP_REDIRECT_URL ? process.env.HTTP_REDIRECT_URL.trim() : '',
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
+    sysIntervalMs: parseInt(process.env.MQTT_SYS_INTERVAL_MS || '10000', 10),
   };
 }
 

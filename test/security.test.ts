@@ -1,13 +1,18 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { Duplex } from 'stream';
+import Aedes from 'aedes';
 import { timingSafeCompare } from '../src/crypto-utils.js';
 import { RateLimiter } from '../src/rate-limiter.js';
 import { MqttStreamValidator } from '../src/mqtt-packet-validator.js';
 import { AbuseDetector } from '../src/abuse-detector.js';
+import { SysMetricsCollector } from '../src/sys-metrics.js';
 import { join } from 'node:path';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { createConnection } from 'node:net';
+import { getAirportInfo } from 'airport-utils';
 
 describe('Security: Timing-Safe Password Comparison', () => {
   it('returns true for matching passwords', () => {
@@ -66,7 +71,7 @@ describe('Security: Bounded RateLimiter & Expiration Pruning', () => {
     }
   });
 
-  it('blocks IP after reaching maxFailedConnections threshold', () => {
+  it('blocks IP after reaching maxFailedConnections threshold and reports in getStats()', () => {
     const limiter = new RateLimiter(60000, 3, 300000, 10, 0);
 
     try {
@@ -80,6 +85,16 @@ describe('Security: Bounded RateLimiter & Expiration Pruning', () => {
       const blocked = limiter.recordFailure(testIP); // 3 (threshold reached)
       assert.strictEqual(blocked, true);
       assert.strictEqual(limiter.isBlocked(testIP), true);
+
+      const stats = limiter.getStats();
+      assert.strictEqual(stats.trackedIPCount, 1);
+      assert.strictEqual(stats.blockedIPCount, 1);
+      assert.strictEqual(stats.totalBlocksIssued, 1);
+      assert.strictEqual(stats.totalBlockedAttempts, 2); // 1 on block + 1 on isBlocked(testIP) check
+      assert.strictEqual(stats.blockedIPs.length, 1);
+      assert.strictEqual(stats.blockedIPs[0].ip, testIP);
+      assert.strictEqual(stats.blockedIPs[0].failures, 3);
+      assert.ok(stats.blockedIPs[0].remainingSeconds > 0);
     } finally {
       limiter.destroy();
     }
@@ -214,12 +229,75 @@ describe('Security: WebSocket Backpressure Handling', () => {
   });
 });
 
-
-describe('AbuseDetector: Built-in node:sqlite Persistence', () => {
-  it('persists and reloads client trust state across restarts', () => {
+describe('AbuseDetector: Built-in node:sqlite Persistence & Summary Telemetry', () => {
+  it('persists and reloads client trust state across restarts, and tracks would_mute & regional stats', () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-sqlite-test-'));
     const dbPath = join(tempDir, 'abuse.db');
     const config = {
+      duplicateWindowSize: 100,
+      duplicateWindowMs: 300000,
+      duplicateThreshold: 10,
+      maxDuplicatesPerPacket: 2,
+      duplicateRateThreshold: 0.3,
+      duplicateRateWindowMs: 300000,
+      bucketCapacity: 20,
+      bucketRefillRate: 3,
+      maxPacketSize: 255,
+      maxTopicsPerDay: 3,
+      anomalyThreshold: 1,
+      maxIataChanges24h: 3,
+      topicHistorySize: 50,
+      topicHistoryWindowMs: 86400000,
+      persistencePath: dbPath,
+      persistenceIntervalMs: 300000,
+      stateRetentionMs: 604800000,
+      enforcementEnabled: false,
+    };
+
+    try {
+      const pubKey = 'A'.repeat(64);
+      const detector1 = new AbuseDetector(config);
+      detector1.initializeClient(pubKey, `v1_${pubKey}`, '198.51.100.1');
+      const state1 = detector1.getClientStats(pubKey)!;
+      detector1.checkIataChange(state1, 'SEA');
+
+      // Record oversized raw packet to trigger anomaly & would_mute (since anomalyThreshold=1 and enforcementEnabled=false)
+      const oversizedHex = 'FF'.repeat(300);
+      detector1.recordPacket({ publicKey: pubKey }, { payload: Buffer.from(JSON.stringify({ origin_id: pubKey, raw: oversizedHex })) });
+
+      const summary = detector1.getAllStats();
+      assert.strictEqual(summary.trackedPublishers, 1);
+      assert.strictEqual(summary.wouldMutePublishersCount, 1);
+      assert.strictEqual(summary.anomalousPublishersCount, 1);
+      assert.strictEqual(summary.activeByIata1h['SEA']?.activePublishers1h, 1);
+      assert.strictEqual(summary.flaggedPublishers.length, 1);
+      assert.strictEqual(summary.flaggedPublishers[0].status, 'would_mute');
+      detector1.shutdown();
+
+      const detector2 = new AbuseDetector(config);
+      const state2 = detector2.getClientStats(pubKey);
+      assert.ok(state2, 'Expected persisted client trust state to be reloaded');
+      assert.strictEqual(state2?.publicKey, pubKey);
+      assert.strictEqual(state2?.status, 'would_mute');
+      assert.strictEqual(state2?.recentIPs[0]?.ip, '198.51.100.1');
+      detector2.shutdown();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('$SYS Telemetry: SysMetricsCollector', () => {
+  it('formats uptime and publishes deduplicated retained $SYS/broker/# topics', () => {
+    assert.strictEqual(SysMetricsCollector.formatUptime(45), '45s');
+    assert.strictEqual(SysMetricsCollector.formatUptime(3665), '1h 1m 5s');
+    assert.strictEqual(SysMetricsCollector.formatUptime(90061), '1d 1h 1m 1s');
+
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-sys-test-'));
+    const dbPath = join(tempDir, 'abuse.db');
+    const aedes = new Aedes({ id: 'broker' });
+    const limiter = new RateLimiter(60000, 5, 300000, 100, 0);
+    const detector = new AbuseDetector({
       duplicateWindowSize: 100,
       duplicateWindowMs: 300000,
       duplicateThreshold: 10,
@@ -238,29 +316,74 @@ describe('AbuseDetector: Built-in node:sqlite Persistence', () => {
       persistenceIntervalMs: 300000,
       stateRetentionMs: 604800000,
       enforcementEnabled: false,
-    };
+    });
+
+    const publishedTopics = new Map<string, string>();
+    aedes.on('publish', (packet) => {
+      if (packet.topic.startsWith('$SYS/broker/')) {
+        publishedTopics.set(packet.topic, packet.payload.toString('utf-8'));
+      }
+    });
+
+    const subscriberAccounts = new Map([
+      ['admin', { roleName: 'admin', maxConnections: 10, activeConnections: new Set(['c1']) }],
+    ]);
+
+    const collector = new SysMetricsCollector({
+      aedes,
+      rateLimiter: limiter,
+      abuseDetector: detector,
+      subscriberAccounts,
+      brokerVersion: '1.0.0',
+      wsPort: 8883,
+      tcpEnabled: true,
+      tcpPort: 1883,
+      intervalMs: 60000,
+    });
 
     try {
-      const pubKey = 'A'.repeat(64);
-      const detector1 = new AbuseDetector(config);
-      detector1.initializeClient(pubKey, `v1_${pubKey}`, '198.51.100.1');
-      detector1.shutdown();
+      const pubKey = 'B'.repeat(64);
+      detector.initializeClient(pubKey, `v1_${pubKey}`, '10.0.0.5');
+      const state = detector.getClientStats(pubKey)!;
+      detector.checkIataChange(state, 'PDX');
+      detector.recordPacket({ publicKey: pubKey }, { payload: Buffer.from('{"origin_id":"' + pubKey + '"}') });
 
-      const detector2 = new AbuseDetector(config);
-      const state = detector2.getClientStats(pubKey);
-      assert.ok(state, 'Expected persisted client trust state to be reloaded');
-      assert.strictEqual(state?.publicKey, pubKey);
-      assert.strictEqual(state?.recentIPs[0]?.ip, '198.51.100.1');
-      detector2.shutdown();
+      collector.recordClientConnected(2);
+      collector.recordAuthFailure();
+      collector.recordUnauthorizedPublish();
+      collector.recordStaleStatusFiltered();
+      collector.recordPublish(`meshcore/PDX/${pubKey}/packets`, 128, false, true);
+      collector.recordPublish(`meshcore/PDX/${pubKey}/status`, 64, false, true);
+      collector.recordPublish(`meshcore/PDX/${pubKey}/internal`, 256, true, false);
+
+      collector.publishSnapshot();
+
+      assert.ok(publishedTopics.has('$SYS/broker/summary'));
+      assert.ok(publishedTopics.has('$SYS/broker/system'));
+      assert.ok(publishedTopics.has('$SYS/broker/clients'));
+      assert.ok(publishedTopics.has('$SYS/broker/regions'));
+      assert.ok(publishedTopics.has('$SYS/broker/regions/PDX'));
+      assert.ok(publishedTopics.has('$SYS/broker/traffic'));
+      assert.ok(publishedTopics.has('$SYS/broker/security'));
+
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/messages/received'), '2');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/messages/bytes_received'), '192');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/by_subtopic/packets'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/by_subtopic/status'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/by_subtopic/internal'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/traffic/stale_status_filtered'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/security/auth_failures'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/security/unauthorized_publishes'), '1');
+      assert.strictEqual(publishedTopics.get('$SYS/broker/system/retained_messages'), '1');
     } finally {
+      collector.stop();
+      limiter.destroy();
+      detector.shutdown();
+      aedes.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
 });
-
-import { spawn } from 'node:child_process';
-import { createConnection } from 'node:net';
-import { getAirportInfo } from 'airport-utils';
 
 describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
   it('validates IATA airport codes with updated airport-utils', () => {
@@ -269,7 +392,7 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
     assert.throws(() => getAirportInfo('ZZZ'));
   });
 
-  it('starts compiled dist/server.js, serves /health, and authenticates MQTT over TCP', async () => {
+  it('starts compiled dist/server.js, serves /health, authenticates Admin over TCP, and delivers retained $SYS/broker/summary', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-e2e-test-'));
     const dbPath = join(tempDir, 'abuse.db');
     const wsPort = 18883;
@@ -285,6 +408,7 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
         AUTH_EXPECTED_AUDIENCE: 'test.local',
         HTTP_REDIRECT_URL: '',
         MQTT_MAX_PACKET_BYTES: '65536',
+        MQTT_SYS_INTERVAL_MS: '10000',
         SUBSCRIBER_MAX_CONNECTIONS_DEFAULT: '2',
         SUBSCRIBER_1: 'admin:testpass123:1:2',
         ABUSE_ENFORCEMENT_ENABLED: 'false',
@@ -295,7 +419,7 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
         ABUSE_DUPLICATE_RATE_THRESHOLD: '0.3',
         ABUSE_DUPLICATE_RATE_WINDOW_MS: '300000',
         ABUSE_BUCKET_CAPACITY: '20',
-        ABUSE_BUCKET_REFILL_RATE: '3',
+        ABUSE_BUCKET_REFILL_RATE: 3 as any,
         ABUSE_MAX_PACKET_SIZE: '255',
         ABUSE_MAX_TOPICS_PER_DAY: '3',
         ABUSE_ANOMALY_THRESHOLD: '10',
@@ -335,8 +459,12 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
       assert.strictEqual(healthRes.status, 200);
       assert.strictEqual(await healthRes.text(), '{"status":"ok","service":"MeshCore MQTT Broker"}');
 
-      // 2. Verify MQTT TCP connection with valid subscriber credentials
-      const connackCode = await new Promise<number>((resolve, reject) => {
+      // 2. Verify MQTT TCP connection with Admin subscriber credentials and subscribe to $SYS/broker/summary
+      const sysSummaryPayload = await new Promise<string>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timed out waiting for retained $SYS/broker/summary')), 4000);
+        let stage: 'connecting' | 'subscribing' = 'connecting';
+        let receivedBuf = Buffer.alloc(0);
+
         const socket = createConnection({ host: '127.0.0.1', port: tcpPort }, () => {
           // Build MQTT 3.1.1 CONNECT packet with username="admin", password="testpass123"
           const vh = Buffer.from([
@@ -352,13 +480,50 @@ describe('Dependencies & End-to-End Compiled Broker (dist/server.js)', () => {
           const packet = Buffer.concat([Buffer.from([0x10, body.length]), body]);
           socket.write(packet);
         });
+
         socket.on('data', (data) => {
-          socket.destroy();
-          resolve(data[3]); // CONNACK return code byte
+          receivedBuf = Buffer.concat([receivedBuf, data]);
+
+          if (stage === 'connecting' && receivedBuf.length >= 4) {
+            assert.strictEqual(receivedBuf[0], 0x20, 'Expected CONNACK packet');
+            assert.strictEqual(receivedBuf[3], 0x00, 'Expected CONNACK 0x00 (Connection Accepted)');
+            receivedBuf = receivedBuf.slice(4);
+            stage = 'subscribing';
+
+            // Send SUBSCRIBE packet (0x82) for topic "$SYS/broker/summary"
+            const topicBytes = Buffer.from('$SYS/broker/summary', 'utf-8');
+            const subBody = Buffer.concat([
+              Buffer.from([0x00, 0x01]), // Packet Identifier = 1
+              Buffer.from([0x00, topicBytes.length]),
+              topicBytes,
+              Buffer.from([0x00]), // Requested QoS 0
+            ]);
+            socket.write(Buffer.concat([Buffer.from([0x82, subBody.length]), subBody]));
+          }
+
+          if (stage === 'subscribing') {
+            const str = receivedBuf.toString('utf-8');
+            const jsonStart = str.indexOf('{"timestamp":');
+            if (jsonStart !== -1 && str.includes('"retainedMessages":')) {
+              clearTimeout(timeout);
+              socket.destroy();
+              resolve(str.slice(jsonStart));
+            }
+          }
         });
-        socket.on('error', reject);
+
+        socket.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
+        });
       });
-      assert.strictEqual(connackCode, 0x00, 'Expected CONNACK 0x00 (Connection Accepted)');
+
+      const parsedSummary = JSON.parse(sysSummaryPayload);
+      assert.ok(parsedSummary.version.includes('meshcore-mqtt-broker'));
+      assert.strictEqual(typeof parsedSummary.uptimeSeconds, 'number');
+      assert.ok(parsedSummary.clients);
+      assert.ok(parsedSummary.traffic);
+      assert.ok(parsedSummary.security);
     } finally {
       child.kill();
       await new Promise((resolve) => child.once('exit', resolve));

@@ -1,6 +1,6 @@
 # meshcore-mqtt-broker
 
-A WebSocket-based MQTT broker with MeshCore Ed25519 public key authentication, role-based subscribers, remote serial command routing, abuse detection & trust telemetry, connection rate limiting, and optional standard TCP MQTT support.
+A WebSocket-based MQTT broker with MeshCore Ed25519 public key authentication, role-based subscribers, remote serial command routing, abuse detection & trust telemetry, connection rate limiting, retained `$SYS/broker/#` operational metrics, and optional standard TCP MQTT support.
 
 [![Build and Push Docker Image](https://github.com/Dhovin/meshcore-mqtt-broker/actions/workflows/docker-build.yml/badge.svg)](https://github.com/Dhovin/meshcore-mqtt-broker/actions/workflows/docker-build.yml)
 
@@ -11,6 +11,7 @@ A WebSocket-based MQTT broker with MeshCore Ed25519 public key authentication, r
 - **Public Key Authentication**: Ed25519 JWT authentication for publishers using MeshCore public keys (`v1_{PUBLIC_KEY}`)
 - **Role-Based Subscribers**: Configurable accounts (Admin, Full Access, Limited) with timing-safe password verification and per-account concurrent connection limits
 - **Remote Serial Access**: Bidirectional support for admin-issued `/serial/commands` and publisher-signed `/serial/responses`
+- **Rich `$SYS/broker/#` Telemetry**: Retained JSON & scalar metrics updated every 10 seconds for Role 1 (`admin`) subscribers in **MQTT Explorer** (uptime, memory/CPU, connected publishers by IATA region, subscriber account usage, rolling 1m/5m traffic rates, blocked IPs, and muted/anomalous publishers)
 - **Abuse Detection & Trust Telemetry**: Token-bucket rate tracking, SHA-256 duplicate packet detection, raw LoRa packet size validation, 24h IATA region change limits, SQLite state persistence with 7-day retention pruning, and retained `/internal` admin telemetry
 - **Connection Rate Limiting**: IP-based rate limiter (10 failed/unauthenticated attempts in 60s blocks IP for 5 minutes) across HTTP, WebSocket, and TCP listeners
 - **Production-Ready Docker**: Pre-built multi-arch containers (`linux/amd64` and `linux/arm64`) on GHCR with automatic `PUID`/`PGID` privilege dropping and `/health` (`/healthz`) endpoints
@@ -210,6 +211,69 @@ Examples:
 
 ---
 
+## `$SYS/broker/#` Telemetry (MQTT Explorer & Admin Monitoring)
+
+For Role 1 (`admin`) subscribers, the broker publishes a rich hierarchy of **retained** operational metrics under `$SYS/broker/#` every `MQTT_SYS_INTERVAL_MS` (default: `10000` ms / 10 seconds), deduplicating unchanged scalar values to minimize network traffic.
+
+This hybrid layout is optimized for **MQTT Explorer**:
+- **JSON Summary Topics** display formatted, syntax-highlighted JSON with change-diffing in MQTT Explorer's value panel.
+- **Scalar Subtopics** display values inline in the topic tree and can be clicked in MQTT Explorer to plot real-time line graphs.
+
+| Topic | Type | Description |
+| :--- | :---: | :--- |
+| `$SYS/broker/summary` | JSON | All-in-one snapshot of broker health, clients, active IATA regions, traffic rates, and security |
+| `$SYS/broker/version` | String | Broker version, Aedes version, and Node.js runtime version |
+| `$SYS/broker/started_at` | String | ISO-8601 timestamp when the broker started |
+| `$SYS/broker/uptime` | Number | Broker uptime in seconds |
+| `$SYS/broker/uptime/formatted` | String | Human-readable uptime (`Xd Xh Xm Xs`) |
+| `$SYS/broker/system` | JSON | Memory (`rssMb`, `heapUsedMb`, `heapTotalMb`, `externalMb`), CPU %, event loop lag, listeners, retained & subscription counts |
+| `$SYS/broker/system/memory/rss_mb` | Number | Process Resident Set Size (MB) |
+| `$SYS/broker/system/memory/heap_used_mb` | Number | V8 Heap Used (MB) |
+| `$SYS/broker/system/memory/heap_total_mb` | Number | V8 Heap Total (MB) |
+| `$SYS/broker/system/cpu_percent` | Number | Process CPU utilization (%) over the last interval |
+| `$SYS/broker/system/event_loop_lag_ms` | Number | Event loop timer drift / lag (ms) |
+| `$SYS/broker/system/retained_messages` | Number | Total active retained messages (excluding `$SYS/#`) |
+| `$SYS/broker/system/subscriptions` | Number | Total active client topic subscriptions |
+| `$SYS/broker/clients` | JSON | Full breakdown of connected clients, peak concurrent, publishers, subscribers by role & account, and WebSocket vs. TCP |
+| `$SYS/broker/clients/connected` | Number | Currently connected clients |
+| `$SYS/broker/clients/maximum` | Number | Peak concurrent connected clients since startup |
+| `$SYS/broker/clients/publishers` | Number | Currently connected MeshCore publishers |
+| `$SYS/broker/clients/subscribers` | Number | Currently connected subscribers |
+| `$SYS/broker/clients/websocket` | Number | Active WebSocket connections |
+| `$SYS/broker/clients/tcp` | Number | Active plain TCP connections |
+| `$SYS/broker/clients/total_connections` | Number | Lifetime connections since startup |
+| `$SYS/broker/clients/total_disconnects` | Number | Lifetime disconnections since startup |
+| `$SYS/broker/clients/subscribers_by_account` | JSON | Per-account `{ role, active, max }` connection usage |
+| `$SYS/broker/regions` | JSON | Summary of all IATA regions (`connectedPublishers`, `activePublishers1h`, `trackedPublishers`, `totalPacketsReceived`, `connectedPublisherPrefixes`) |
+| `$SYS/broker/regions/active_count` | Number | Count of IATA regions with currently connected or 1h-active publishers |
+| `$SYS/broker/regions/{IATA}` | JSON | Detailed stats for a specific IATA region (e.g., `SEA`, `PDX`, `BOS`, `test`) |
+| `$SYS/broker/regions/{IATA}/publishers` | Number | Currently connected publishers in `{IATA}` |
+| `$SYS/broker/regions/{IATA}/packets` | Number | Total packets received from publishers in `{IATA}` |
+| `$SYS/broker/traffic` | JSON | Total messages & bytes received, 1m/5m rolling rates, subtopic breakdown, and stale status filter counts |
+| `$SYS/broker/traffic/messages/received` | Number | Total client messages published |
+| `$SYS/broker/traffic/messages/bytes_received` | Number | Total client payload bytes received |
+| `$SYS/broker/traffic/rate/messages_per_sec_1m` | Number | Rolling 1-minute message rate (`msg/s`) |
+| `$SYS/broker/traffic/rate/messages_per_sec_5m` | Number | Rolling 5-minute message rate (`msg/s`) |
+| `$SYS/broker/traffic/rate/bytes_per_sec_1m` | Number | Rolling 1-minute throughput (`bytes/s`) |
+| `$SYS/broker/traffic/rate/bytes_per_sec_5m` | Number | Rolling 5-minute throughput (`bytes/s`) |
+| `$SYS/broker/traffic/by_subtopic/*` | Number | Individual counters for `packets`, `status`, `serial_commands`, `serial_responses`, and `internal` |
+| `$SYS/broker/traffic/stale_status_filtered` | Number | Out-of-order `/status` (LWT race) messages blocked |
+| `$SYS/broker/security` | JSON | Combined security telemetry: auth failures, unauthorized publishes, IP rate limiter, and abuse detector summary |
+| `$SYS/broker/security/auth_failures` | Number | Total failed authentication attempts |
+| `$SYS/broker/security/unauthorized_publishes` | Number | Total denied publish attempts |
+| `$SYS/broker/security/rate_limiter` | JSON | Rate limiter state including list of currently blocked IPs and remaining block durations |
+| `$SYS/broker/security/rate_limiter/blocked_ips_count` | Number | Currently blocked IP count |
+| `$SYS/broker/security/rate_limiter/tracked_ips_count` | Number | Currently tracked failing IP count |
+| `$SYS/broker/security/rate_limiter/total_blocked_attempts` | Number | Total connection/HTTP attempts rejected due to IP blocks |
+| `$SYS/broker/security/abuse_detector` | JSON | Abuse detector summary including top flagged/muted/`would_mute` publishers |
+| `$SYS/broker/security/abuse_detector/muted_count` | Number | Publishers currently in `'muted'` status (`ABUSE_ENFORCEMENT_ENABLED=true`) |
+| `$SYS/broker/security/abuse_detector/would_mute_count` | Number | Publishers in `'would_mute'` status (`ABUSE_ENFORCEMENT_ENABLED=false`) |
+| `$SYS/broker/security/abuse_detector/anomalies_total` | Number | Total anomalies across tracked publishers |
+| `$SYS/broker/security/abuse_detector/duplicates_total` | Number | Total duplicate packets detected across tracked publishers |
+| `$SYS/broker/security/abuse_detector/silenced_total` | Number | Total packets silenced from muted publishers |
+
+---
+
 ## Abuse Detection, Rate Limiting & Security
 
 ### 1. IP Connection Rate Limiter (`RateLimiter`)
@@ -225,8 +289,8 @@ Tracks per-publisher behavioral metrics in memory and persists state to a SQLite
 - **Raw LoRa Packet Size Check**: If a published JSON message includes a hex-encoded `raw` field whose byte length (`raw.length / 2`) exceeds `ABUSE_MAX_PACKET_SIZE` (default `255` bytes), a `packet_size` anomaly is recorded.
 - **IATA Change Tracking**: Monitors how many times a publisher changes its `{IATA_CODE}` region within a rolling 24-hour window (`ABUSE_MAX_IATA_CHANGES_24H`).
 - **Telemetry & Enforcement (`ABUSE_ENFORCEMENT_ENABLED`)**:
-  - When `ABUSE_ENFORCEMENT_ENABLED=true`, exceeding rate limits, IATA change limits, or `ABUSE_ANOMALY_THRESHOLD` transitions the publisher's trust state `status` to `'muted'` (recording `mutedAt` and `muteReason`). When `false`, the broker logs `WOULD MUTE` and keeps `status` as `'allowed'`.
-  - Trust metrics are published in real time to `meshcore/{IATA}/{PUBLIC_KEY}/internal` under `trust_state` for administrative monitoring and downstream filtering.
+  - When `ABUSE_ENFORCEMENT_ENABLED=true`, exceeding rate limits, IATA change limits, or `ABUSE_ANOMALY_THRESHOLD` transitions the publisher's trust state `status` to `'muted'` (recording `mutedAt` and `muteReason`). When `false`, the broker logs `WOULD MUTE` and transitions `status` to `'would_mute'`.
+  - Trust metrics are published in real time to `meshcore/{IATA}/{PUBLIC_KEY}/internal` under `trust_state` and summarized in `$SYS/broker/security/abuse_detector` for administrative monitoring and downstream filtering.
 - **Bounded Persistence**: State is saved to SQLite every `ABUSE_PERSISTENCE_INTERVAL_MS` (default 5 minutes) and on `SIGINT`/`SIGTERM` shutdown. Clients with no packet activity for longer than `ABUSE_STATE_RETENTION_MS` (default 7 days) are automatically evicted from memory and disk.
 
 ### 3. HTTP Health Check & Browser Redirect
@@ -256,6 +320,7 @@ cp .env.example .env
 | `MQTT_TCP_PORT` | No | `1883` | Port for the optional plain TCP MQTT listener |
 | `HTTP_REDIRECT_URL` | No | `""` | Optional URL to redirect (`302`) non-WebSocket HTTP requests (except `/health` & `/healthz`) |
 | `MQTT_MAX_PACKET_BYTES` | No | `65536` | Maximum allowed MQTT publish payload size in bytes (`MqttStreamValidator` allows `+4096` bytes headroom for headers/topic) |
+| `MQTT_SYS_INTERVAL_MS` | No | `10000` | Interval (`ms`) between retained `$SYS/broker/#` telemetry updates (default: 10 seconds) |
 | `PUID` | No *(Docker only)* | `1000` | UID used by `docker-entrypoint.sh` for `/data` ownership and privilege drop |
 | `PGID` | No *(Docker only)* | `1000` | GID used by `docker-entrypoint.sh` for `/data` ownership and privilege drop |
 

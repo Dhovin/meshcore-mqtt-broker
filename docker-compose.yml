@@ -23,6 +23,7 @@ services:
       - AUTH_EXPECTED_AUDIENCE=${AUTH_EXPECTED_AUDIENCE-}
       - HTTP_REDIRECT_URL=${HTTP_REDIRECT_URL:-}
       - MQTT_MAX_PACKET_BYTES=${MQTT_MAX_PACKET_BYTES:-65536}
+      - MQTT_SYS_INTERVAL_MS=${MQTT_SYS_INTERVAL_MS:-10000}
       # Subscribe-Only Accounts (format: username:password:role:maxConnections)
       # Role: 1=admin, 2=full_access, 3=limited (default). maxConnections: override count or default
       - SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=${SUBSCRIBER_MAX_CONNECTIONS_DEFAULT:-2}

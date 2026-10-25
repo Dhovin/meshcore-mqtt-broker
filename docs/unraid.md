@@ -73,8 +73,8 @@ Click **+ Add another Port, Variable, Line or Device**:
 Click **+ Add another Port, Variable, Line or Device** to create each variable required for your deployment:
 
 1. **User / Group IDs (`PUID` & `PGID` for unRAID Appdata Permissions)**:
-   - **Config Type**: `Variable` | **Name**: `PUID` | **Key**: `PUID` | **Value**: `99` *(unRAID `nobody` user)*
-   - **Config Type**: `Variable` | **Name**: `PGID` | **Key**: `PGID` | **Value**: `100` *(unRAID `users` group)*
+    - **Config Type**: `Variable` | **Name**: `PUID` | **Key**: `PUID` | **Value**: `99` *(unRAID `nobody` user)*
+    - **Config Type**: `Variable` | **Name**: `PGID` | **Key**: `PGID` | **Value**: `100` *(unRAID `users` group)*
 
 2. **Authentication Audience**:
    - **Config Type**: `Variable`
@@ -120,6 +120,12 @@ Click **+ Add another Port, Variable, Line or Device** to create each variable r
    - **Name**: `Abuse Enforcement`
    - **Key**: `ABUSE_ENFORCEMENT_ENABLED`
    - **Value**: `false` *(Set to `true` to mark offending clients as `'muted'` in `/internal` trust state)*
+
+10. **`$SYS` Telemetry Update Interval (Optional)**:
+    - **Config Type**: `Variable`
+    - **Name**: `SYS Telemetry Interval (ms)`
+    - **Key**: `MQTT_SYS_INTERVAL_MS`
+    - **Value**: `10000` *(Updates retained `$SYS/broker/#` topics every 10 seconds for Role 1 Admin subscribers)*
 
 ---
 
