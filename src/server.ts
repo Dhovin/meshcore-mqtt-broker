@@ -15,12 +15,12 @@ import { MqttStreamValidator } from './mqtt-packet-validator.js';
 import { SysMetricsCollector, SubscriberAccountMeta } from './sys-metrics.js';
 
 // Read broker version from package.json
-let brokerVersion = '1.0.0';
+let brokerVersion = '1.0.3';
 try {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
   if (pkg.version) brokerVersion = pkg.version;
 } catch {
-  // Fallback to 1.0.0 if package.json cannot be read
+  // Fallback to 1.0.3 if package.json cannot be read
 }
 
 // Load and validate configuration
