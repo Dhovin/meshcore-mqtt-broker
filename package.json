@@ -1,16 +1,17 @@
 {
   "name": "meshcore-mqtt-broker",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "description": "MeshCore MQTT broker with public key authentication",
   "type": "module",
   "main": "dist/server.js",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.22.1"
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "tsx src/server.ts",
+    "pretest": "npm run build",
     "test": "tsx --test test/**/*.test.ts"
   },
   "keywords": [

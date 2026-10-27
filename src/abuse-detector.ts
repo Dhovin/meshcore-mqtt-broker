@@ -148,6 +148,36 @@ export interface AbuseConfig {
   enforcementEnabled: boolean;
 }
 
+export interface AbuseDetectorSummary {
+  enforcementEnabled: boolean;
+  trackedPublishers: number;
+  mutedPublishersCount: number;
+  wouldMutePublishersCount: number;
+  anomalousPublishersCount: number;
+  totalPacketsReceived: number;
+  totalPacketsSilenced: number;
+  totalDuplicates: number;
+  totalAnomalies: number;
+  activeByIata1h: Record<string, {
+    activePublishers1h: number;
+    trackedPublishers: number;
+    totalPacketsReceived: number;
+  }>;
+  flaggedPublishers: {
+    publicKeyPrefix: string;
+    publicKey: string;
+    currentIata?: string;
+    status: 'allowed' | 'muted' | 'would_mute';
+    muteReason?: string;
+    mutedAt?: number;
+    anomalyCount: number;
+    duplicateCount: number;
+    totalPacketsReceived: number;
+    peakRateObserved: number;
+    lastPacketAt: number;
+  }[];
+}
+
 interface SerializedTrustState {
   publicKey: string;
   username: string;
@@ -518,17 +548,82 @@ export class AbuseDetector {
     return this.clients.get(publicKey);
   }
 
-  public getAllStats() {
+  /**
+   * Compute a single-pass, memory-bounded summary of abuse detection and regional activity for $SYS telemetry
+   */
+  public getAllStats(maxFlagged: number = 25): AbuseDetectorSummary {
+    const oneHourAgo = Date.now() - RATE_WINDOW_MS;
+    let mutedPublishersCount = 0;
+    let wouldMutePublishersCount = 0;
+    let anomalousPublishersCount = 0;
+    let totalPacketsReceived = 0;
+    let totalPacketsSilenced = 0;
+    let totalDuplicates = 0;
+    let totalAnomalies = 0;
+
+    const activeByIata1h: AbuseDetectorSummary['activeByIata1h'] = {};
+    const flaggedCandidates: AbuseDetectorSummary['flaggedPublishers'] = [];
+
+    for (const state of this.clients.values()) {
+      totalPacketsReceived += state.totalPacketsReceived;
+      totalPacketsSilenced += state.totalPacketsSilenced;
+      totalDuplicates += state.duplicateCount;
+      totalAnomalies += state.anomalyCount;
+
+      if (state.status === 'muted') {
+        mutedPublishersCount++;
+      } else if (state.status === 'would_mute') {
+        wouldMutePublishersCount++;
+      }
+
+      if (state.anomalyCount > 0) {
+        anomalousPublishersCount++;
+      }
+
+      if (state.currentIata) {
+        let regionEntry = activeByIata1h[state.currentIata];
+        if (!regionEntry) {
+          regionEntry = { activePublishers1h: 0, trackedPublishers: 0, totalPacketsReceived: 0 };
+          activeByIata1h[state.currentIata] = regionEntry;
+        }
+        regionEntry.trackedPublishers++;
+        regionEntry.totalPacketsReceived += state.totalPacketsReceived;
+        if (state.lastPacketAt >= oneHourAgo) {
+          regionEntry.activePublishers1h++;
+        }
+      }
+
+      if (state.status !== 'allowed' || state.anomalyCount > 0) {
+        flaggedCandidates.push({
+          publicKeyPrefix: state.publicKey.substring(0, 8),
+          publicKey: state.publicKey,
+          currentIata: state.currentIata,
+          status: state.status,
+          muteReason: state.muteReason,
+          mutedAt: state.mutedAt,
+          anomalyCount: state.anomalyCount,
+          duplicateCount: state.duplicateCount,
+          totalPacketsReceived: state.totalPacketsReceived,
+          peakRateObserved: Math.round(state.peakRateObserved * 100) / 100,
+          lastPacketAt: state.lastPacketAt,
+        });
+      }
+    }
+
+    flaggedCandidates.sort((a, b) => b.anomalyCount - a.anomalyCount || b.lastPacketAt - a.lastPacketAt);
+
     return {
-      ...this.stats,
-      clients: Array.from(this.clients.entries()).map(([key, state]) => ({
-        publicKey: key,
-        status: state.status,
-        totalPacketsReceived: state.totalPacketsReceived,
-        totalPacketsSilenced: state.totalPacketsSilenced,
-        duplicateCount: state.duplicateCount,
-        anomalyCount: state.anomalyCount,
-      })),
+      enforcementEnabled: this.config.enforcementEnabled,
+      trackedPublishers: this.clients.size,
+      mutedPublishersCount,
+      wouldMutePublishersCount,
+      anomalousPublishersCount,
+      totalPacketsReceived,
+      totalPacketsSilenced,
+      totalDuplicates,
+      totalAnomalies,
+      activeByIata1h,
+      flaggedPublishers: flaggedCandidates.slice(0, maxFlagged),
     };
   }
 
@@ -836,8 +931,12 @@ export class AbuseDetector {
       this.stats.totalClientsMuted++;
       console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] MUTED (reason: ${reason})`);
     } else {
+      if (state.status !== 'would_mute') {
+        state.status = 'would_mute';
+        state.mutedAt = Date.now();
+        state.muteReason = reason;
+      }
       console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] WOULD MUTE (reason: ${reason}) [enforcement disabled]`);
     }
   }
 }
-

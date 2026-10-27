@@ -3,6 +3,7 @@ import { createServer } from 'http';
 import { createServer as createTcpServer } from 'net';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
+import { readFileSync } from 'fs';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter.js';
@@ -11,6 +12,16 @@ import { AbuseDetector } from './abuse-detector.js';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config.js';
 import { timingSafeCompare } from './crypto-utils.js';
 import { MqttStreamValidator } from './mqtt-packet-validator.js';
+import { SysMetricsCollector, SubscriberAccountMeta } from './sys-metrics.js';
+
+// Read broker version from package.json
+let brokerVersion = '1.0.3';
+try {
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+  if (pkg.version) brokerVersion = pkg.version;
+} catch {
+  // Fallback to 1.0.3 if package.json cannot be read
+}
 
 // Load and validate configuration
 const mqttConfig = loadMqttConfig();
@@ -57,6 +68,7 @@ const subscriberMaxConnections = new Map<string, number>();
 
 // Track active connections per subscriber username
 const subscriberActiveConnections = new Map<string, Set<string>>();
+const subscriberAccountsMeta = new Map<string, SubscriberAccountMeta>();
 
 let subscriberIndex = 1;
 while (true) {
@@ -95,13 +107,19 @@ while (true) {
     subscriberMaxConnections.set(username, maxConn);
     
     // Initialize active connections set for this user
-    subscriberActiveConnections.set(username, new Set());
+    const activeSet = new Set<string>();
+    subscriberActiveConnections.set(username, activeSet);
     
     const roleNames = {
       [SubscriberRole.ADMIN]: 'admin',
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
       [SubscriberRole.LIMITED]: 'limited'
     };
+    subscriberAccountsMeta.set(username, {
+      roleName: roleNames[role],
+      maxConnections: maxConn,
+      activeConnections: activeSet,
+    });
     console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
     console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
@@ -116,14 +134,27 @@ if (subscriberUsers.size === 0) {
   console.log(`[CONFIG] Default max connections per subscriber: ${subscriberConfig.defaultMaxConnections}`);
 }
 
-// Create Aedes MQTT broker
-const aedes = new Aedes();
+// Create Aedes MQTT broker with fixed 'broker' ID so built-in $SYS topics group cleanly under $SYS/broker/...
+const aedes = new Aedes({ id: 'broker' });
 
 // Rate limiting for failed connections
 const rateLimiter = new RateLimiter(60000, 10, 300000);
 
 // Abuse detection
 const abuseDetector = new AbuseDetector(abuseConfig);
+
+// $SYS telemetry collector (publishes retained metrics every sysIntervalMs for Role 1 ADMIN subscribers)
+const sysMetrics = new SysMetricsCollector({
+  aedes,
+  rateLimiter,
+  abuseDetector,
+  subscriberAccounts: subscriberAccountsMeta,
+  brokerVersion,
+  wsPort: WS_PORT,
+  tcpEnabled: ENABLE_TCP,
+  tcpPort: TCP_PORT,
+  intervalMs: mqttConfig.sysIntervalMs,
+});
 
 // Helper to get client identifier for logging
 function getClientLogPrefix(client: any): string {
@@ -157,6 +188,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         
         if (activeConns.size >= maxConn) {
           console.log(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
+          sysMetrics.recordAuthFailure();
           callback(null, false);
           return;
         }
@@ -181,6 +213,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         callback(null, true);
       } else {
         console.log(`${logPrefix} [AUTH] ✗ Subscriber authentication failed - Invalid password`);
+        sysMetrics.recordAuthFailure();
         callback(null, false);
       }
       return;
@@ -190,6 +223,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Username format: v1_{UPPERCASE_PUBLIC_KEY}
     if (!usernameStr.startsWith('v1_')) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid username format: ${usernameStr}`);
+      sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
     }
@@ -200,12 +234,14 @@ aedes.authenticate = async (client, username, password, callback) => {
     if (!/^[0-9A-F]{64}$/i.test(publicKey)) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
       console.log(`${logPrefix} [AUTH] Public key length: ${publicKey.length}, hex dump: ${Buffer.from(publicKey).toString('hex')}`);
+      sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
     }
 
     if (!passwordStr || passwordStr.length === 0) {
       console.log(`${logPrefix} [AUTH] ✗ No password provided`);
+      sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
     }
@@ -220,6 +256,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);      
       console.debug(`${logPrefix} [AUTH] Public key: ${publicKey}`);
       console.debug(`${logPrefix} [AUTH] Token hex: ${Buffer.from(passwordStr).toString('hex')}`);
+      sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
     }
@@ -227,6 +264,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Validate audience claim if configured
     if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
+      sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
     }
@@ -252,6 +290,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     callback(null, true);
   } catch (error) {
     console.error(`${logPrefix} [AUTH] Error during authentication:`, error);
+    sysMetrics.recordAuthFailure();
     callback(null, false);
   }
 };
@@ -269,6 +308,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   // Enforce maximum packet payload size to prevent event loop freezes and memory exhaustion
   if (packet.payload && packet.payload.length > mqttConfig.maxPacketBytes) {
     console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+    sysMetrics.recordUnauthorizedPublish();
     callback(new Error(`Payload size exceeds maximum allowed size of ${mqttConfig.maxPacketBytes} bytes`));
     return;
   }
@@ -309,11 +349,13 @@ aedes.authorizePublish = (client, packet, callback) => {
         }
       }
       console.log(`${logPrefix} [AUTHZ] ✗ Serial command denied (invalid topic format) -> ${packet.topic}`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Invalid serial/commands topic format'));
       return;
     }
     
     console.log(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
+    sysMetrics.recordUnauthorizedPublish();
     callback(new Error('Subscriber clients are subscribe-only'));
     return;
   }
@@ -322,6 +364,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   if (clientType === ClientType.PUBLISHER) {
     if (!packet.topic.startsWith('meshcore/')) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (not meshcore/*)`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Publishers can only publish to meshcore/* topics'));
       return;
     }
@@ -335,6 +378,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     const topicParts = packet.topic.split('/').map(part => part.trim());
     if (topicParts.length < 4) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (must be meshcore/IATA/PUBKEY/subtopic format)`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Topic must be meshcore/IATA/PUBKEY/subtopic format (4 parts required)'));
       return;
     }
@@ -347,6 +391,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (XXX not valid, configure actual IATA)`);
       console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location code: XXX`);
       console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('XXX is a placeholder - please configure your actual IATA location code'));
       client.close();
       return;
@@ -366,6 +411,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}" (length: ${locationCode.length})`);
         console.log(`${logPrefix} [DISCONNECT] Location hex: ${Buffer.from(locationCode).toString('hex')}`);
         console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"'));
         client.close();
         return;
@@ -377,6 +423,7 @@ aedes.authorizePublish = (client, packet, callback) => {
         console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code`);
         console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}"`);
         console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be a valid IATA international airport code or "test"'));
         client.close();
         return;
@@ -393,6 +440,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       console.log(`${logPrefix} [DISCONNECT] Topic pubkey: "${topicPublicKey}" (length: ${topicPublicKey.length})`);
       console.log(`${logPrefix} [DISCONNECT] Topic pubkey hex: ${Buffer.from(topicPublicKey).toString('hex')}`);
       console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Public key in topic must be 64 hex characters'));
       client.close();
       return;
@@ -406,6 +454,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       console.log(`${logPrefix} [DISCONNECT] Topic pubkey:  "${topicPublicKey}"`);
       console.log(`${logPrefix} [DISCONNECT] Client pubkey: "${clientPublicKey}"`);
       console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Public key in topic must match authenticated public key'));
       client.close();
       return;
@@ -416,6 +465,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     // For the test region, always normalize to lowercase "test"
     const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
     const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${topicParts.slice(3).join('/')}`;
+    (client as any).currentIata = normalizedLocation;
     
     // Update the packet topic to the normalized version
     if (packet.topic !== normalizedTopic) {
@@ -430,6 +480,7 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is blocked
     if (subtopic === 'internal') {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Clients are not permitted to publish directly to /internal subtopics'));
       return;
     }
@@ -439,6 +490,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       const jwtParts = payload.split('.');
       if (jwtParts.length !== 3) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT format)`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
@@ -446,6 +498,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       const base64urlRegex = /^[A-Za-z0-9_-]+$/;
       if (!jwtParts.every(part => base64urlRegex.test(part))) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT encoding)`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
@@ -461,6 +514,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       
       if (!message.origin_id) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Message must contain origin_id field'));
         return;
       }
@@ -471,6 +525,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       
       if (messageOriginId !== normalizedClientKey) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (origin_id mismatch)`);
+        sysMetrics.recordUnauthorizedPublish();
         callback(new Error('origin_id must match authenticated public key'));
         return;
       }
@@ -566,6 +621,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       callback(null);
     } catch (error) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JSON or validation error)`);
+      sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Invalid message format or origin_id validation failed'));
     }
     return;
@@ -573,6 +629,7 @@ aedes.authorizePublish = (client, packet, callback) => {
   
   // Unknown client type
   console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unknown client type)`);
+  sysMetrics.recordUnauthorizedPublish();
   callback(new Error('Unknown client type'));
 };
 
@@ -667,6 +724,7 @@ aedes.authorizeForward = (client, packet) => {
         if (timestamp < lastTimestamp) {
           // This is a stale status message (probably a delayed LWT)
           console.log(`[FILTER] Blocking stale status message for ${originId.substring(0, 8)} (${new Date(timestamp).toISOString()} < ${new Date(lastTimestamp).toISOString()})`);
+          sysMetrics.recordStaleStatusFiltered();
           return null; // Block this stale message
         }
         
@@ -770,8 +828,9 @@ aedes.on('client', (client) => {
   console.log(`${logPrefix} [CLIENT] Connected`);
   console.log(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!(client as any).conn}, clientIP: ${(client as any).conn?.clientIP}`);
   
-  // Track when this client connected for disconnect timing
+  // Track when this client connected for disconnect timing and $SYS metrics
   (client as any).connectedAt = Date.now();
+  sysMetrics.recordClientConnected((aedes as any).connectedClients || 1);
   
   // Hook into the client's stream close event to see WHO closed it
   const stream = (client as any).stream;
@@ -797,6 +856,7 @@ aedes.on('clientDisconnect', (client) => {
   const duration = connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : 'unknown';
   
   console.log(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
+  sysMetrics.recordClientDisconnected();
   
   // Log additional info to debug why this client disconnected
   if (client) {
@@ -817,10 +877,11 @@ aedes.on('clientDisconnect', (client) => {
 });
 
 aedes.on('publish', (packet, client) => {
+  sysMetrics.recordPublish(packet.topic, packet.payload.length, Boolean(packet.retain), Boolean(client));
   if (client) {
     const logPrefix = getClientLogPrefix(client);
     console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
-  } else {
+  } else if (!packet.topic.startsWith('$SYS/')) {
     console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
   }
 });
@@ -985,8 +1046,9 @@ wsServer.on('connection', (ws, req) => {
     }
   });
 
-  // Store client IP on stream for logging
+  // Store client IP and transport on stream for logging and $SYS metrics
   (stream as any).clientIP = clientIP;
+  (stream as any).transport = 'websocket';
   (stream as any).authenticated = false;
   
   // Handle WebSocket close
@@ -1056,6 +1118,7 @@ if (ENABLE_TCP) {
 
     console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
     (socket as any).clientIP = clientIP;
+    (socket as any).transport = 'tcp';
     (socket as any).authenticated = false;
 
     const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
@@ -1100,10 +1163,16 @@ if (ENABLE_TCP) {
   });
 }
 
+// Start periodic $SYS telemetry publishing
+sysMetrics.start();
+
 httpServer.listen(WS_PORT, HOST, () => {
+  const aedesVer = (aedes as any).version || '0.51.3';
+  const bannerTitle = `MeshCore MQTT Broker v${brokerVersion}`.padEnd(51, ' ');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║         MeshCore MQTT Broker                               ║');
+  console.log(`║         ${bannerTitle}║`);
   console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log(`Runtime Environment:        Node.js ${process.version} (${process.platform}/${process.arch}, aedes v${aedesVer})`);
   console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
   if (ENABLE_TCP) {
     console.log(`Standard TCP MQTT listening on: mqtt://${HOST}:${TCP_PORT}`);
@@ -1115,6 +1184,7 @@ httpServer.listen(WS_PORT, HOST, () => {
   } else {
     console.log('HTTP Browser Redirect:      Disabled (serving 200 OK status)');
   }
+  console.log(`$SYS Telemetry Interval:    ${mqttConfig.sysIntervalMs}ms (Admin-only, retained)`);
   console.log('');
   console.log('Authentication Modes:');
   console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
@@ -1138,6 +1208,7 @@ function shutdown(): void {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  sysMetrics.stop();
   if (tcpServer) {
     tcpServer.close();
   }

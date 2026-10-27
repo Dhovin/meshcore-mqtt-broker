@@ -9,6 +9,19 @@ interface RateLimitRecord {
   blockedUntil?: number;
 }
 
+export interface RateLimiterStats {
+  trackedIPCount: number;
+  blockedIPCount: number;
+  totalBlocksIssued: number;
+  totalBlockedAttempts: number;
+  blockedIPs: {
+    ip: string;
+    failures: number;
+    blockedUntil: number;
+    remainingSeconds: number;
+  }[];
+}
+
 export class RateLimiter {
   private failedConnectionsByIP = new Map<string, RateLimitRecord>();
   private readonly windowMs: number;
@@ -16,6 +29,8 @@ export class RateLimiter {
   private readonly blockDurationMs: number;
   private readonly maxEntries: number;
   private cleanupInterval?: NodeJS.Timeout;
+  private totalBlocksIssued = 0;
+  private totalBlockedAttempts = 0;
 
   constructor(
     windowMs: number = 60000,          // 1 minute
@@ -102,7 +117,11 @@ export class RateLimiter {
       return false;
     }
 
-    return Boolean(record.blockedUntil && now < record.blockedUntil);
+    const isCurrentlyBlocked = Boolean(record.blockedUntil && now < record.blockedUntil);
+    if (isCurrentlyBlocked) {
+      this.totalBlockedAttempts++;
+    }
+    return isCurrentlyBlocked;
   }
 
   /**
@@ -143,6 +162,8 @@ export class RateLimiter {
     // Block if threshold exceeded
     if (record.count >= this.maxFailedConnections && !record.blockedUntil) {
       record.blockedUntil = now + this.blockDurationMs;
+      this.totalBlocksIssued++;
+      this.totalBlockedAttempts++;
       console.log(
         `[RATE_LIMIT] Blocking IP ${ip} for ${this.blockDurationMs / 1000}s ` +
         `(${record.count} failed connections in ${this.windowMs / 1000}s)`
@@ -151,6 +172,41 @@ export class RateLimiter {
     }
 
     return false;
+  }
+
+  /**
+   * Return a bounded snapshot of rate limiter metrics for $SYS telemetry
+   */
+  getStats(maxBlockedList: number = 50): RateLimiterStats {
+    const now = Date.now();
+    let blockedIPCount = 0;
+    const blockedIPs: RateLimiterStats['blockedIPs'] = [];
+
+    for (const [ip, record] of this.failedConnectionsByIP.entries()) {
+      if (this.isRecordExpired(record, now)) {
+        this.failedConnectionsByIP.delete(ip);
+        continue;
+      }
+      if (record.blockedUntil && now < record.blockedUntil) {
+        blockedIPCount++;
+        if (blockedIPs.length < maxBlockedList) {
+          blockedIPs.push({
+            ip,
+            failures: record.count,
+            blockedUntil: record.blockedUntil,
+            remainingSeconds: Math.max(0, Math.ceil((record.blockedUntil - now) / 1000)),
+          });
+        }
+      }
+    }
+
+    return {
+      trackedIPCount: this.failedConnectionsByIP.size,
+      blockedIPCount,
+      totalBlocksIssued: this.totalBlocksIssued,
+      totalBlockedAttempts: this.totalBlockedAttempts,
+      blockedIPs,
+    };
   }
 
   /**
@@ -169,5 +225,7 @@ export class RateLimiter {
       this.cleanupInterval = undefined;
     }
     this.failedConnectionsByIP.clear();
+    this.totalBlocksIssued = 0;
+    this.totalBlockedAttempts = 0;
   }
 }
