@@ -2,7 +2,7 @@ name: Build and Push Docker Image
 
 on:
   push:
-    branches: [ "main", "master", "feat/sys-info-telemetry" ]
+    branches: [ "main", "master" ]
     tags: [ 'v*.*.*' ]
     paths-ignore:
       - '**.md'

@@ -168,21 +168,21 @@ export class SysMetricsCollector {
    * Record a published packet on the broker (hot path - O(1), zero allocations)
    */
   public recordPublish(topic: string, payloadLength: number, retain: boolean, isClientPublish: boolean): void {
-    // Track retained message set
+    // Do not count $SYS internal publishes in retainedTopics or traffic throughput
+    if (topic.startsWith('$SYS/')) {
+      if (retain && payloadLength === 0) {
+        this.lastPublishedPayloads.delete(topic);
+      }
+      return;
+    }
+
+    // Track non-$SYS retained message set
     if (retain) {
       if (payloadLength === 0) {
         this.retainedTopics.delete(topic);
-        if (topic.startsWith('$SYS/')) {
-          this.lastPublishedPayloads.delete(topic);
-        }
       } else {
         this.retainedTopics.add(topic);
       }
-    }
-
-    // Do not count $SYS internal publishes in traffic throughput
-    if (topic.startsWith('$SYS/')) {
-      return;
     }
 
     if (topic.endsWith('/internal')) {

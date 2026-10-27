@@ -11,6 +11,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "tsx src/server.ts",
+    "pretest": "npm run build",
     "test": "tsx --test test/**/*.test.ts"
   },
   "keywords": [
