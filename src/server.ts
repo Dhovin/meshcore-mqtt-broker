@@ -4,15 +4,19 @@ import { createServer as createTcpServer } from 'net';
 import { WebSocketServer } from 'ws';
 import { Duplex } from 'stream';
 import { readFileSync } from 'fs';
+import { dirname } from 'path';
+import { createHash } from 'crypto';
 import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter.js';
 import { getClientIP } from './ip-utils.js';
 import { AbuseDetector } from './abuse-detector.js';
-import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig } from './config.js';
+import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig, loadPeerConfig } from './config.js';
 import { timingSafeCompare } from './crypto-utils.js';
 import { MqttStreamValidator } from './mqtt-packet-validator.js';
 import { SysMetricsCollector, SubscriberAccountMeta } from './sys-metrics.js';
+import { PeerBridgeManager, validatePeerPacket } from './peer-bridge.js';
+import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto.js';
 
 // Read broker version from package.json
 let brokerVersion = '1.0.3';
@@ -27,6 +31,8 @@ try {
 const mqttConfig = loadMqttConfig();
 const abuseConfig = loadAbuseConfig();
 const subscriberConfig = loadSubscriberConfig();
+const peerConfig = loadPeerConfig();
+const isDebug = mqttConfig.logLevel === 'debug';
 
 const WS_PORT = mqttConfig.wsPort;
 const TCP_PORT = mqttConfig.tcpPort;
@@ -34,6 +40,28 @@ const ENABLE_TCP = mqttConfig.enableTcp;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
+
+// Initialize peer identity and outbound peer bridge manager if configured
+let peerIdentity: PeerKeyPair | undefined;
+let peerBridgeManager: PeerBridgeManager | undefined;
+
+if (
+  peerConfig.peers.length > 0 ||
+  peerConfig.peerPrivateKey ||
+  (peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.size > 0)
+) {
+  try {
+    const dataDir = dirname(abuseConfig.persistencePath);
+    peerIdentity = await loadOrCreatePeerIdentity(peerConfig.peerPrivateKey, dataDir);
+    console.log(`[PEER] Broker peer identity initialized - Public Key: ${peerIdentity.publicKeyHex}`);
+  } catch (err: any) {
+    console.error(`[PEER] Failed to initialize peer identity: ${err?.message || err}`);
+  }
+}
+
+if (peerConfig.peers.length > 0) {
+  peerBridgeManager = new PeerBridgeManager(peerConfig, peerIdentity, isDebug);
+}
 
 // Helper function to validate IATA airport codes
 function isValidIATACode(code: string): boolean {
@@ -45,22 +73,33 @@ function isValidIATACode(code: string): boolean {
   }
 }
 
+// Allowed publisher subtopics
+const ALLOWED_PUBLISHER_SUBTOPICS = new Set([
+  'packets',
+  'status',
+  'neighbors',
+  'raw',
+  'serial/responses',
+]);
+
 // Client types
 enum ClientType {
   SUBSCRIBER = 'subscriber',
-  PUBLISHER = 'publisher'
+  PUBLISHER = 'publisher',
+  PEER = 'peer',
 }
 
 // Subscriber roles
 enum SubscriberRole {
   ADMIN = 1,           // Full access + can delete retained messages
   FULL_ACCESS = 2,     // Full access, no hidden data
-  LIMITED = 3          // All access but with hidden/sensitive data filtered
+  LIMITED = 3,         // All access but with hidden/sensitive data filtered
+  PEER = 4,            // Inbound peer broker connection (publish-only)
 }
 
 // Load subscriber users from environment variables
 // Format: SUBSCRIBER_1=username:password:role:maxConnections, SUBSCRIBER_2=username:password:role:maxConnections, etc.
-// Role: 1=admin (full+delete), 2=full_access (no hidden data), 3=limited (filtered data)
+// Role: 1=admin (full+delete), 2=full_access (no hidden data), 3=limited (filtered data), 4=peer (inbound peer broker)
 // maxConnections: number for override, D or omit to use default
 const subscriberUsers = new Map<string, string>();
 const subscriberRoles = new Map<string, SubscriberRole>();
@@ -90,7 +129,7 @@ while (true) {
     let role = SubscriberRole.LIMITED;
     if (roleStr) {
       const roleNum = parseInt(roleStr);
-      if (roleNum === 1 || roleNum === 2 || roleNum === 3) {
+      if (roleNum === 1 || roleNum === 2 || roleNum === 3 || roleNum === 4) {
         role = roleNum as SubscriberRole;
       }
     }
@@ -110,10 +149,11 @@ while (true) {
     const activeSet = new Set<string>();
     subscriberActiveConnections.set(username, activeSet);
     
-    const roleNames = {
+    const roleNames: Record<SubscriberRole, string> = {
       [SubscriberRole.ADMIN]: 'admin',
       [SubscriberRole.FULL_ACCESS]: 'full_access', 
-      [SubscriberRole.LIMITED]: 'limited'
+      [SubscriberRole.LIMITED]: 'limited',
+      [SubscriberRole.PEER]: 'peer',
     };
     subscriberAccountsMeta.set(username, {
       roleName: roleNames[role],
@@ -122,7 +162,7 @@ while (true) {
     });
     console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
-    console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
+    console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex} (value redacted)`);
   }
   
   subscriberIndex++;
@@ -154,7 +194,230 @@ const sysMetrics = new SysMetricsCollector({
   tcpEnabled: ENABLE_TCP,
   tcpPort: TCP_PORT,
   intervalMs: mqttConfig.sysIntervalMs,
+  getPeerStats: () => (peerBridgeManager ? peerBridgeManager.getPeerStats() : {}),
 });
+
+// WeakMap caches keyed by packet.payload Buffer (survives Aedes `new Packet(packet)` cloning)
+const parsedPayloadCache = new WeakMap<Buffer, any>();
+const limitedPayloadCache = new WeakMap<Buffer, Buffer>();
+
+function ensureBuffer(payload: string | Buffer): Buffer {
+  return typeof payload === 'string' ? Buffer.from(payload, 'utf-8') : payload;
+}
+
+function getParsedJson(payload: string | Buffer): any {
+  const buf = ensureBuffer(payload);
+  let parsed = parsedPayloadCache.get(buf);
+  if (parsed !== undefined) {
+    return parsed;
+  }
+  parsed = JSON.parse(buf.toString('utf-8'));
+  parsedPayloadCache.set(buf, parsed);
+  return parsed;
+}
+
+// Silently drop a packet without disconnecting the publishing client or peer bridge.
+function dropPacketSilently(packet: any, callback: (err?: Error | null) => void): void {
+  packet.topic = '$drop';
+  packet.retain = false;
+  callback(null);
+}
+
+// Inbound peer rate limiting (token bucket per authenticated peer identity)
+const peerRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+function checkPeerRateLimit(peerKey: string): boolean {
+  const rate = peerConfig.peerRateLimitPerSec || 500;
+  // Set burst capacity at or above PEER_QUEUE_MAX_SIZE so a full recovery backlog drain
+  // is accepted without dropping packets, while sustained floods beyond `rate` are capped.
+  const capacity = Math.max(peerConfig.maxQueueSize || 5000, rate * 2, 100);
+  const now = Date.now();
+  let bucket = peerRateBuckets.get(peerKey);
+  if (!bucket) {
+    if (peerRateBuckets.size >= 1000) {
+      const oldest = peerRateBuckets.keys().next().value;
+      if (oldest) peerRateBuckets.delete(oldest);
+    }
+    bucket = { tokens: capacity, lastRefill: now };
+    peerRateBuckets.set(peerKey, bucket);
+  } else {
+    const elapsedSec = Math.max(0, (now - bucket.lastRefill) / 1000);
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsedSec * rate);
+    bucket.lastRefill = now;
+  }
+  if (bucket.tokens < 1) {
+    return false;
+  }
+  bucket.tokens -= 1;
+  return true;
+}
+
+// Bounded cross-path deduplication cache for non-status telemetry (packets, neighbors, raw)
+const DEDUP_TTL_MS = 120_000;
+const DEDUP_MAX_ENTRIES = 50_000;
+const seenPacketHashes = new Map<
+  string,
+  { timestamp: number; sourceId: string; forwardedByLocal: boolean }
+>();
+
+function checkCrossPathDuplicate(
+  normalizedTopic: string,
+  subtopic: string,
+  payload: Buffer,
+  sourceId: string,
+  isPeerClient: boolean
+): { duplicate: boolean; shouldForwardToPeers: boolean } {
+  if (subtopic !== 'packets' && subtopic !== 'neighbors' && subtopic !== 'raw') {
+    return { duplicate: false, shouldForwardToPeers: false };
+  }
+  const now = Date.now();
+  const hash = createHash('sha256').update(normalizedTopic).update(':').update(payload).digest('hex');
+  const existing = seenPacketHashes.get(hash);
+  if (existing !== undefined && now - existing.timestamp < DEDUP_TTL_MS) {
+    // If the duplicate arrived from a DIFFERENT client connection (e.g., dual-connected observer
+    // or multi-peer path) or over a peer link, drop it for local subscribers.
+    // However, if a peer copy arrived first (!existing.forwardedByLocal) and the direct local
+    // observer copy arrives second (!isPeerClient), still forward the local observer copy to
+    // outbound peers so backup paths (e.g., C -> B when A -> B is down) remain intact.
+    if (isPeerClient || existing.sourceId !== sourceId) {
+      let shouldForwardToPeers = false;
+      if (!isPeerClient && !existing.forwardedByLocal) {
+        existing.forwardedByLocal = true;
+        shouldForwardToPeers = true;
+      }
+      return { duplicate: true, shouldForwardToPeers };
+    }
+  }
+
+  if (!seenPacketHashes.has(hash) && seenPacketHashes.size >= DEDUP_MAX_ENTRIES) {
+    let evicted = 0;
+    for (const [k, entry] of seenPacketHashes) {
+      if (now - entry.timestamp >= DEDUP_TTL_MS || evicted < 1000) {
+        seenPacketHashes.delete(k);
+        evicted++;
+        if (seenPacketHashes.size < DEDUP_MAX_ENTRIES && now - entry.timestamp < DEDUP_TTL_MS) {
+          break;
+        }
+      }
+    }
+  }
+
+  seenPacketHashes.set(hash, {
+    timestamp: now,
+    sourceId,
+    forwardedByLocal: !isPeerClient,
+  });
+  return { duplicate: false, shouldForwardToPeers: false };
+}
+
+// Throttle retained /internal publishes to once per 30s per observer (or immediately on status change)
+const INTERNAL_PUBLISH_INTERVAL_MS = 30_000;
+const lastInternalPublishMap = new Map<string, { timestamp: number; status: string }>();
+
+function maybePublishInternalState(
+  normalizedLocation: string,
+  clientPublicKey: string,
+  tokenPayload: any,
+  trustState: any,
+  logPrefix: string,
+  forceImmediate = false
+): void {
+  if (!tokenPayload) return;
+
+  const now = Date.now();
+  const currentStatus = trustState?.status || 'allowed';
+  const prev = lastInternalPublishMap.get(clientPublicKey);
+
+  if (
+    !forceImmediate &&
+    prev &&
+    prev.status === currentStatus &&
+    now - prev.timestamp < INTERNAL_PUBLISH_INTERVAL_MS
+  ) {
+    return;
+  }
+
+  if (!lastInternalPublishMap.has(clientPublicKey) && lastInternalPublishMap.size >= 10_000) {
+    const oldestKey = lastInternalPublishMap.keys().next().value;
+    if (oldestKey) lastInternalPublishMap.delete(oldestKey);
+  }
+  lastInternalPublishMap.set(clientPublicKey, { timestamp: now, status: currentStatus });
+
+  const internalTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/internal`;
+  let trustMetrics: any = null;
+
+  if (trustState) {
+    const clockQuality =
+      trustState.clockTracking.erraticJumps.length === 0
+        ? 'stable'
+        : trustState.clockTracking.erraticJumps.length < 3
+          ? 'syncing'
+          : 'erratic';
+
+    trustMetrics = {
+      status: trustState.status,
+      mutedUntil: trustState.mutedUntil ?? null,
+      enforcement_enabled: abuseConfig.enforcementEnabled,
+      totalPacketsReceived: trustState.totalPacketsReceived,
+      totalPacketsSilenced: trustState.totalPacketsSilenced,
+      duplicateCount: trustState.duplicateCount,
+      anomalyCount: trustState.anomalyCount,
+      anomalies: trustState.anomalies.slice(0, 20).map((a: any) => ({
+        type: a.type,
+        details: a.details,
+        timestamp: a.timestamp,
+      })),
+      peakRateObserved: Math.round(trustState.peakRateObserved * 100) / 100,
+      tokenBucket: {
+        tokens: Math.round(trustState.tokenBucket.tokens * 10) / 10,
+        capacity: trustState.tokenBucket.capacity,
+      },
+      iataTracking: {
+        currentIata: trustState.currentIata,
+        iataChangeCount24h: trustState.iataChangeCount24h,
+        iataHistory: trustState.iataHistory.map((h: any) => h.iata),
+      },
+      clockTracking: {
+        estimatedOffset: trustState.clockTracking.estimatedOffset
+          ? Math.round(trustState.clockTracking.estimatedOffset / 1000)
+          : undefined,
+        erraticJumpCount: trustState.clockTracking.erraticJumps.length,
+        lastDeviceTimestamp: trustState.clockTracking.lastDeviceTimestamp,
+        clockQuality,
+      },
+      recentIPs: trustState.recentIPs.slice(0, 10).map((ip: any) => ({
+        ip: ip.ip,
+        connectionCount: ip.connectionCount,
+        lastSeen: ip.lastSeen,
+      })),
+    };
+  }
+
+  const internalMessage = {
+    origin_id: clientPublicKey,
+    timestamp: now,
+    jwt_payload: tokenPayload,
+    trust_state: trustMetrics,
+  };
+
+  aedes.publish(
+    {
+      cmd: 'publish',
+      topic: internalTopic,
+      payload: Buffer.from(JSON.stringify(internalMessage)),
+      qos: 0,
+      dup: false,
+      retain: true,
+    },
+    (err) => {
+      if (err) {
+        console.error(`${logPrefix} [INTERNAL] Failed to publish JWT payload:`, err);
+      } else if (isDebug) {
+        console.log(`${logPrefix} [INTERNAL] Published JWT payload -> ${internalTopic}`);
+      }
+    }
+  );
+}
 
 // Helper to get client identifier for logging
 function getClientLogPrefix(client: any): string {
@@ -163,6 +426,11 @@ function getClientLogPrefix(client: any): string {
   const clientType = client.clientType;
   if (clientType === ClientType.PUBLISHER && client.publicKey) {
     return `[O:${client.publicKey.substring(0, 8)}]`;
+  } else if (clientType === ClientType.PEER) {
+    if (client.publicKey) {
+      return `[P:${client.publicKey.substring(0, 8)}]`;
+    }
+    return `[P:${client.username || client.id}]`;
   } else if (clientType === ClientType.SUBSCRIBER && client.username) {
     return `[S:${client.username}]`;
   }
@@ -172,13 +440,15 @@ function getClientLogPrefix(client: any): string {
 // Authentication handler
 aedes.authenticate = async (client, username, password, callback) => {
   const logPrefix = `[C:${client.id}]`;
-  console.log(`${logPrefix} [AUTH] Authentication attempt - Username: ${username}`);
+  if (isDebug) {
+    console.log(`${logPrefix} [AUTH] Authentication attempt - Username: ${username}`);
+  }
 
   try {
     const usernameStr = username?.toString() || '';
     const passwordStr = password?.toString() || '';
 
-    // Check if this is a subscriber login
+    // Check if this is a subscriber or role-4 peer login
     if (subscriberUsers.has(usernameStr)) {
       const expectedPassword = subscriberUsers.get(usernameStr) || '';
       if (timingSafeCompare(passwordStr, expectedPassword)) {
@@ -198,15 +468,23 @@ aedes.authenticate = async (client, username, password, callback) => {
         subscriberActiveConnections.set(usernameStr, activeConns);
         
         const role = subscriberRoles.get(usernameStr) || SubscriberRole.LIMITED;
-        console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
-        (client as any).clientType = ClientType.SUBSCRIBER;
-        (client as any).username = usernameStr;
-        (client as any).role = role;
+        if (role === SubscriberRole.PEER) {
+          console.log(`${logPrefix} [AUTH] ✓ Peer broker authenticated (${usernameStr}, connections: ${activeConns.size}/${maxConn})`);
+          (client as any).clientType = ClientType.PEER;
+          (client as any).username = usernameStr;
+          (client as any).role = role;
+        } else {
+          console.log(`${logPrefix} [AUTH] ✓ Subscriber authenticated (${usernameStr}, role: ${role}, connections: ${activeConns.size}/${maxConn})`);
+          (client as any).clientType = ClientType.SUBSCRIBER;
+          (client as any).username = usernameStr;
+          (client as any).role = role;
+        }
         
         // Mark stream as authenticated
         const stream = (client as any).conn;
         if (stream && stream.clientIP) {
           stream.authenticated = true;
+          stream.trustedPeer = role === SubscriberRole.PEER;
           stream.client = client;
         }
         
@@ -219,7 +497,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       return;
     }
 
-    // Otherwise, check for JWT-based publisher authentication
+    // Otherwise, check for JWT-based publisher or peer authentication
     // Username format: v1_{UPPERCASE_PUBLIC_KEY}
     if (!usernameStr.startsWith('v1_')) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid username format: ${usernameStr}`);
@@ -233,7 +511,6 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Validate public key format (should be 64 hex characters)
     if (!/^[0-9A-F]{64}$/i.test(publicKey)) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
-      console.log(`${logPrefix} [AUTH] Public key length: ${publicKey.length}, hex dump: ${Buffer.from(publicKey).toString('hex')}`);
       sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
@@ -246,16 +523,11 @@ aedes.authenticate = async (client, username, password, callback) => {
       return;
     }
 
-    // Verify the auth token using meshcore-decoder
+    // Verify the auth token using meshcore-decoder (never log raw passwordStr)
     const tokenPayload = await verifyAuthToken(passwordStr, publicKey);
-    console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);
 
-    
     if (!tokenPayload) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid token signature`);
-      console.debug(`${logPrefix} [AUTH] Token input: "${passwordStr}"`);      
-      console.debug(`${logPrefix} [AUTH] Public key: ${publicKey}`);
-      console.debug(`${logPrefix} [AUTH] Token hex: ${Buffer.from(passwordStr).toString('hex')}`);
+      console.log(`${logPrefix} [AUTH] ✗ Invalid token signature for public key: ${publicKey.substring(0, 8)}...`);
       sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
@@ -268,8 +540,27 @@ aedes.authenticate = async (client, username, password, callback) => {
       callback(null, false);
       return;
     }
-    
+
     const shortKey = publicKey.substring(0, 8);
+    const stream = (client as any).conn;
+
+    // Check if this public key is an authorized peer broker (AUTHORIZED_PEERS)
+    if (peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.has(publicKey)) {
+      console.log(`[P:${shortKey}] [AUTH] ✓ Peer broker authenticated via Ed25519 JWT${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
+      (client as any).publicKey = publicKey;
+      (client as any).tokenPayload = tokenPayload;
+      (client as any).clientType = ClientType.PEER;
+
+      if (stream && stream.clientIP) {
+        stream.authenticated = true;
+        stream.trustedPeer = true;
+        stream.client = client;
+      }
+
+      callback(null, true);
+      return;
+    }
+    
     console.log(`[O:${shortKey}] [AUTH] ✓ Publisher authenticated${tokenPayload.aud ? ` [aud: ${tokenPayload.aud}]` : ''}`);
     // Store the public key and client type with the client for later use
     (client as any).publicKey = publicKey;
@@ -277,7 +568,6 @@ aedes.authenticate = async (client, username, password, callback) => {
     (client as any).clientType = ClientType.PUBLISHER;
     
     // Mark stream as authenticated
-    const stream = (client as any).conn;
     if (stream && stream.clientIP) {
       stream.authenticated = true;
       stream.client = client;
@@ -296,7 +586,14 @@ aedes.authenticate = async (client, username, password, callback) => {
 };
 
 // Authorization handler (control topic access)
-aedes.authorizePublish = (client, packet, callback) => {
+// Deferring rawCallback via process.nextTick ensures mqtt-packet's synchronous _newPacket()
+// loop always finishes resetting parser state before Aedes invokes client._nextBatch(),
+// even when zero subscribers are connected.
+aedes.authorizePublish = (client, packet, rawCallback) => {
+  const callback = (err?: Error | null) => {
+    process.nextTick(rawCallback, err ?? null);
+  };
+
   if (!client) {
     callback(new Error('No client'));
     return;
@@ -316,7 +613,9 @@ aedes.authorizePublish = (client, packet, callback) => {
   // Important: Strip retain flag from /status messages to prevent stale data on ingestor restart
   // LWT (offline) messages are also STATUS messages and should NOT be retained
   if (packet.topic.endsWith('/status') && packet.retain) {
-    console.log(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
+    if (isDebug) {
+      console.log(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
+    }
     packet.retain = false;
   }
   
@@ -359,6 +658,82 @@ aedes.authorizePublish = (client, packet, callback) => {
     callback(new Error('Subscriber clients are subscribe-only'));
     return;
   }
+
+  // Inbound Peer broker clients (ClientType.PEER)
+  if (clientType === ClientType.PEER) {
+    const peerKey = (client as any).publicKey || (client as any).username || client.id;
+    if (!checkPeerRateLimit(peerKey)) {
+      if (isDebug) {
+        console.log(
+          `${logPrefix} [RATE_LIMIT] Dropped peer packet exceeding PEER_RATE_LIMIT_PER_SEC (${peerConfig.peerRateLimitPerSec}/s)`
+        );
+      }
+      sysMetrics.recordPeerRateLimited();
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
+    const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
+    if (!validation.valid) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (${validation.error})`);
+      }
+      sysMetrics.recordUnauthorizedPublish();
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
+    const locationCode = validation.normalizedLocation!;
+    packet.topic = validation.normalizedTopic!;
+    const subtopic = validation.subtopic!;
+    const payloadBuf = ensureBuffer(packet.payload);
+
+    // Deduplicate cross-path packets (e.g., dual-connected observers or multi-hop topologies)
+    const dedup = checkCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, true);
+    if (dedup.duplicate) {
+      if (isDebug) {
+        console.log(`${logPrefix} [DEDUP] Dropped duplicate peer packet -> ${packet.topic}`);
+      }
+      sysMetrics.recordDuplicateFiltered();
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
+    if (validation.parsedMessage && validation.originId) {
+      parsedPayloadCache.set(payloadBuf, validation.parsedMessage);
+      (packet as any)._parsedJson = validation.parsedMessage;
+
+      const originKey = validation.originId;
+      let trustState = abuseDetector.getClientStats(originKey);
+      if (!trustState) {
+        abuseDetector.initializeClient(originKey, `v1_${originKey}`);
+        trustState = abuseDetector.getClientStats(originKey);
+      }
+
+      if (trustState) {
+        trustState.currentIata = locationCode;
+        const allowed = abuseDetector.recordPacket(
+          { publicKey: originKey } as any,
+          packet,
+          validation.parsedMessage,
+          { fromPeer: true }
+        );
+        if (!allowed) {
+          if (isDebug) {
+            console.log(`${logPrefix} [ABUSE] Silenced peer-forwarded packet from muted observer ${originKey.substring(0, 8)}`);
+          }
+          dropPacketSilently(packet, callback);
+          return;
+        }
+      }
+    }
+
+    if (isDebug) {
+      console.log(`${logPrefix} [AUTHZ] ✓ Peer publish authorized -> ${packet.topic}`);
+    }
+    callback(null);
+    return;
+  }
   
   // Publisher clients can only publish to meshcore/* topics
   if (clientType === ClientType.PUBLISHER) {
@@ -371,10 +746,6 @@ aedes.authorizePublish = (client, packet, callback) => {
 
     // Validate topic format
     // Required format: meshcore/{IATA}/{PUBLIC_KEY}/subtopic
-    // Examples:
-    //   meshcore/SEA/ABCD1234.../packets
-    //   meshcore/SEA/ABCD1234.../status
-    //   meshcore/SEA/ABCD1234.../internal (ADMIN only)
     const topicParts = packet.topic.split('/').map(part => part.trim());
     if (topicParts.length < 4) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (must be meshcore/IATA/PUBKEY/subtopic format)`);
@@ -390,7 +761,6 @@ aedes.authorizePublish = (client, packet, callback) => {
     if (locationCode === 'XXX') {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (XXX not valid, configure actual IATA)`);
       console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location code: XXX`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       sysMetrics.recordUnauthorizedPublish();
       callback(new Error('XXX is a placeholder - please configure your actual IATA location code'));
       client.close();
@@ -400,17 +770,11 @@ aedes.authorizePublish = (client, packet, callback) => {
     // Check if this is the special "test" region and normalize it to lowercase
     const isTestRegion = locationCode.toLowerCase() === 'test';
     
-    if (isTestRegion) {
-      console.log(`${logPrefix} [AUTHZ] ✓ Using test region -> ${packet.topic}`);
-      // Continue to validation, don't return here
-    } else {
+    if (!isTestRegion) {
       // First check format (must be 3 uppercase letters, no normalization)
       if (!iataRegex.test(locationCode)) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid format)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location format`);
-        console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}" (length: ${locationCode.length})`);
-        console.log(`${logPrefix} [DISCONNECT] Location hex: ${Buffer.from(locationCode).toString('hex')}`);
-        console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location format: "${locationCode}"`);
         sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"'));
         client.close();
@@ -420,9 +784,7 @@ aedes.authorizePublish = (client, packet, callback) => {
       // Then check if it's a valid IATA code
       if (!isValidIATACode(locationCode)) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code`);
-        console.log(`${logPrefix} [DISCONNECT] Location code: "${locationCode}"`);
-        console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
+        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code: "${locationCode}"`);
         sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be a valid IATA international airport code or "test"'));
         client.close();
@@ -437,9 +799,6 @@ aedes.authorizePublish = (client, packet, callback) => {
     if (!/^[0-9A-F]{64}$/i.test(topicPublicKey)) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid pubkey format)`);
       console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid public key format in topic`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey: "${topicPublicKey}" (length: ${topicPublicKey.length})`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey hex: ${Buffer.from(topicPublicKey).toString('hex')}`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Public key in topic must be 64 hex characters'));
       client.close();
@@ -451,42 +810,49 @@ aedes.authorizePublish = (client, packet, callback) => {
     if (topicPublicKey !== clientPublicKey) {
       console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (pubkey mismatch)`);
       console.log(`${logPrefix} [DISCONNECT] Closing client - Public key mismatch`);
-      console.log(`${logPrefix} [DISCONNECT] Topic pubkey:  "${topicPublicKey}"`);
-      console.log(`${logPrefix} [DISCONNECT] Client pubkey: "${clientPublicKey}"`);
-      console.log(`${logPrefix} [DISCONNECT] Full topic: "${packet.topic}"`);
       sysMetrics.recordUnauthorizedPublish();
       callback(new Error('Public key in topic must match authenticated public key'));
       client.close();
       return;
     }
 
+    const subtopic = topicParts.slice(3).join('/');
+
+    // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is dropped silently
+    if (subtopic === 'internal' || subtopic.startsWith('internal/') || subtopic.includes('/internal')) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      }
+      sysMetrics.recordUnauthorizedPublish();
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
+    // Enforce subtopic allowlist without disconnecting the client
+    if (!ALLOWED_PUBLISHER_SUBTOPICS.has(subtopic)) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (disallowed subtopic: ${subtopic})`);
+      }
+      sysMetrics.recordUnauthorizedPublish();
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
     // Normalize the topic to UPPERCASE for IATA codes and public key component
-    // This prevents duplicate topics with different casing (e.g., 7553b337... vs 7553B337...)
-    // For the test region, always normalize to lowercase "test"
     const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
-    const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${topicParts.slice(3).join('/')}`;
+    const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${subtopic}`;
     (client as any).currentIata = normalizedLocation;
     
-    // Update the packet topic to the normalized version
     if (packet.topic !== normalizedTopic) {
-      console.log(`${logPrefix} [AUTHZ] Normalized topic: ${packet.topic} -> ${normalizedTopic}`);
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] Normalized topic: ${packet.topic} -> ${normalizedTopic}`);
+      }
       packet.topic = normalizedTopic;
     }
 
     // Special handling for serial/responses - payload is a JWT string, not JSON
-    // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/responses
-    const subtopic = topicParts.slice(3).join('/');
-
-    // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is blocked
-    if (subtopic === 'internal') {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (clients cannot publish to /internal directly)`);
-      sysMetrics.recordUnauthorizedPublish();
-      callback(new Error('Clients are not permitted to publish directly to /internal subtopics'));
-      return;
-    }
     if (subtopic === 'serial/responses') {
       const payload = packet.payload.toString('utf-8');
-      // Validate it looks like a JWT (3 base64url parts separated by dots)
       const jwtParts = payload.split('.');
       if (jwtParts.length !== 3) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT format)`);
@@ -494,7 +860,6 @@ aedes.authorizePublish = (client, packet, callback) => {
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
-      // Basic JWT format check - each part should be base64url encoded
       const base64urlRegex = /^[A-Za-z0-9_-]+$/;
       if (!jwtParts.every(part => base64urlRegex.test(part))) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid JWT encoding)`);
@@ -502,24 +867,25 @@ aedes.authorizePublish = (client, packet, callback) => {
         callback(new Error('serial/responses payload must be a valid JWT'));
         return;
       }
-      console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized (serial response) -> ${packet.topic}`);
+      }
       callback(null);
       return;
     }
 
     // Validate that the message contains origin_id matching the authenticated public key
     try {
-      const payload = packet.payload.toString('utf-8');
-      const message = JSON.parse(payload);
+      const message = getParsedJson(packet.payload);
+      (packet as any)._parsedJson = message;
       
-      if (!message.origin_id) {
+      if (!message || typeof message.origin_id !== 'string' || !message.origin_id) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
         sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Message must contain origin_id field'));
         return;
       }
       
-      // Normalize both to uppercase for comparison
       const messageOriginId = message.origin_id.toUpperCase();
       const normalizedClientKey = clientPublicKey.toUpperCase();
       
@@ -529,94 +895,69 @@ aedes.authorizePublish = (client, packet, callback) => {
         callback(new Error('origin_id must match authenticated public key'));
         return;
       }
-      
-      // Track with abuse detector (no enforcement, just tracking)
-      // Use normalizedLocation to ensure consistent tracking regardless of case
-      
-      // Check IATA changes
+
+      // Track with abuse detector and enforce 4-hour temporary mute timeout if enabled
       const trustState = abuseDetector.getClientStats(clientPublicKey);
+      let allowed = true;
       if (trustState) {
+        const prevStatus = trustState.status;
         abuseDetector.checkIataChange(trustState, normalizedLocation);
-        
-        // Record packet
-        abuseDetector.recordPacket(client, packet);
-      }
-      
-      console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
-      
-      // Publish JWT payload to /internal topic (ADMIN-only, contains PII)
-      const tokenPayload = (client as any).tokenPayload;
-      if (tokenPayload) {
-        // Use normalizedLocation to ensure consistent internal topic naming
-        const internalTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/internal`;
-        
-        // Build trust metrics for internal message
-        let trustMetrics: any = null;
-        
-        if (trustState) {
-          const clockQuality = trustState.clockTracking.erraticJumps.length === 0 ? 'stable' :
-                             trustState.clockTracking.erraticJumps.length < 3 ? 'syncing' : 'erratic';
-          
-          trustMetrics = {
-            status: trustState.status,
-            enforcement_enabled: abuseConfig.enforcementEnabled,
-            totalPacketsReceived: trustState.totalPacketsReceived,
-            totalPacketsSilenced: trustState.totalPacketsSilenced,
-            duplicateCount: trustState.duplicateCount,
-            anomalyCount: trustState.anomalyCount,
-            anomalies: trustState.anomalies.slice(0, 20).map(a => ({
-              type: a.type,
-              details: a.details,
-              timestamp: a.timestamp,
-            })),
-            peakRateObserved: Math.round(trustState.peakRateObserved * 100) / 100,
-            tokenBucket: {
-              tokens: Math.round(trustState.tokenBucket.tokens * 10) / 10,
-              capacity: trustState.tokenBucket.capacity,
-            },
-            iataTracking: {
-              currentIata: trustState.currentIata,
-              iataChangeCount24h: trustState.iataChangeCount24h,
-              iataHistory: trustState.iataHistory.map(h => h.iata),
-            },
-            clockTracking: {
-              estimatedOffset: trustState.clockTracking.estimatedOffset ? 
-                Math.round(trustState.clockTracking.estimatedOffset / 1000) : undefined,
-              erraticJumpCount: trustState.clockTracking.erraticJumps.length,
-              lastDeviceTimestamp: trustState.clockTracking.lastDeviceTimestamp,
-              clockQuality,
-            },
-            recentIPs: trustState.recentIPs.slice(0, 10).map(ip => ({
-              ip: ip.ip,
-              connectionCount: ip.connectionCount,
-              lastSeen: ip.lastSeen,
-            })),
-          };
+        allowed = abuseDetector.recordPacket(client, packet, message);
+
+        if (prevStatus !== trustState.status) {
+          maybePublishInternalState(
+            normalizedLocation,
+            clientPublicKey,
+            (client as any).tokenPayload,
+            trustState,
+            logPrefix,
+            true
+          );
         }
-        
-        const internalMessage = {
-          origin_id: clientPublicKey,
-          timestamp: Date.now(),
-          jwt_payload: tokenPayload,
-          trust_state: trustMetrics,
-        };
-        
-        // Publish to internal topic (retained so admins can see it later)
-        aedes.publish({
-          cmd: 'publish',
-          topic: internalTopic,
-          payload: Buffer.from(JSON.stringify(internalMessage)),
-          qos: 0,
-          dup: false,
-          retain: true
-        }, (err) => {
-          if (err) {
-            console.error(`${logPrefix} [INTERNAL] Failed to publish JWT payload:`, err);
-          } else {
-            console.log(`${logPrefix} [INTERNAL] Published JWT payload -> ${internalTopic}`);
-          }
-        });
       }
+
+      if (!allowed) {
+        if (isDebug) {
+          console.log(`${logPrefix} [ABUSE] Silenced packet from muted publisher -> ${packet.topic}`);
+        }
+        dropPacketSilently(packet, callback);
+        return;
+      }
+
+      // Check cross-path deduplication (drops for local subscribers if already received from a peer or second connection,
+      // while preserving outbound peer forwarding if the prior copy came from a peer)
+      const payloadBuf = ensureBuffer(packet.payload);
+      const dedup = checkCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, false);
+      if (dedup.duplicate) {
+        if (dedup.shouldForwardToPeers && peerBridgeManager) {
+          peerBridgeManager.forwardLocalPacket({
+            topic: packet.topic,
+            payload: payloadBuf,
+            qos: packet.qos,
+            retain: packet.retain,
+          });
+        }
+        if (isDebug) {
+          console.log(`${logPrefix} [DEDUP] Dropped cross-path duplicate packet -> ${packet.topic}`);
+        }
+        sysMetrics.recordDuplicateFiltered();
+        dropPacketSilently(packet, callback);
+        return;
+      }
+      
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
+      }
+      
+      // Publish JWT payload to /internal topic (throttled to once per 30s or status change)
+      maybePublishInternalState(
+        normalizedLocation,
+        clientPublicKey,
+        (client as any).tokenPayload,
+        trustState,
+        logPrefix,
+        false
+      );
       
       callback(null);
     } catch (error) {
@@ -638,20 +979,30 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     callback(new Error('No client'));
     return;
   }
+
+  // Never allow subscriptions to internal silent-drop sink topic
+  if (subscription.topic === '$drop' || subscription.topic.startsWith('$drop/')) {
+    callback(new Error('Cannot subscribe to internal drop topic'));
+    return;
+  }
   
   const logPrefix = getClientLogPrefix(client);
   const clientType = (client as any).clientType;
+
+  // Peer clients are publish-only
+  if (clientType === ClientType.PEER) {
+    console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (peer) -> ${subscription.topic}`);
+    callback(new Error('Peer clients are publish-only'));
+    return;
+  }
   
   // Publisher clients cannot subscribe (publish-only) - EXCEPT their own serial/commands topic
   if (clientType === ClientType.PUBLISHER) {
-    // Allow publishers to subscribe to their own serial/commands topic for remote serial access
-    // Topic format: meshcore/{IATA}/{PUBLIC_KEY}/serial/commands
     if (subscription.topic.endsWith('/serial/commands')) {
       const parts = subscription.topic.split('/');
       if (parts.length === 5 && parts[0] === 'meshcore' && parts[3] === 'serial') {
         const topicPublicKey = parts[2].toUpperCase();
         const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
-        // Publisher can only subscribe to their OWN serial/commands topic
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
           console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
           callback(null, subscription);
@@ -678,11 +1029,17 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   callback(new Error('Unknown client type'));
 };
 
-// Track last seen status timestamp per origin_id to prevent race conditions
+// Track last seen status timestamp per origin_id to prevent race conditions (bounded to 10,000 origins)
 const lastStatusTimestamps = new Map<string, number>();
+const MAX_STATUS_ORIGINS = 10_000;
+const MAX_FUTURE_STATUS_SKEW_MS = 60_000;
 
 // Authorization handler for forwarding messages to subscribers (filter sensitive data)
 aedes.authorizeForward = (client, packet) => {
+  if (packet.topic === '$drop') {
+    return null;
+  }
+
   if (!client) {
     return packet;
   }
@@ -693,126 +1050,112 @@ aedes.authorizeForward = (client, packet) => {
   // Block $SYS/* messages for non-admin subscribers (only role 1 can see system topics)
   if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
     if (packet.topic.startsWith('$SYS/')) {
-      return null; // Block delivery of this message
+      return null;
     }
   }
   
   // Critical: Block /internal topics for non-admin subscribers (contains PII)
   if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
     if (packet.topic.includes('/internal')) {
-      return null; // Block delivery of this message
+      return null;
     }
   }
   
   // Block /serial/* topics for non-admin subscribers (remote serial access is admin-only)
   if (clientType === ClientType.SUBSCRIBER && role !== SubscriberRole.ADMIN) {
     if (packet.topic.includes('/serial/')) {
-      return null; // Block delivery of this message
+      return null;
     }
   }
   
   // Prevent stale status messages from overwriting newer ones (LWT race condition)
   if (packet.topic.endsWith('/status') && packet.payload && packet.payload.length > 0) {
     try {
-      const message = JSON.parse(packet.payload.toString());
-      const originId = message.origin_id;
-      const timestamp = message.timestamp ? new Date(message.timestamp).getTime() : 0;
+      const message = getParsedJson(packet.payload);
+      const originId = message?.origin_id;
+      const rawTimestamp = message?.timestamp ? new Date(message.timestamp).getTime() : 0;
       
-      if (originId && timestamp) {
+      if (originId && rawTimestamp && !isNaN(rawTimestamp)) {
+        // Clamp future timestamps to prevent future-timestamp poisoning DoS
+        const effectiveTimestamp = Math.min(rawTimestamp, Date.now() + MAX_FUTURE_STATUS_SKEW_MS);
         const lastTimestamp = lastStatusTimestamps.get(originId) || 0;
         
-        if (timestamp < lastTimestamp) {
-          // This is a stale status message (probably a delayed LWT)
-          console.log(`[FILTER] Blocking stale status message for ${originId.substring(0, 8)} (${new Date(timestamp).toISOString()} < ${new Date(lastTimestamp).toISOString()})`);
+        if (effectiveTimestamp < lastTimestamp) {
+          if (isDebug) {
+            console.log(`[FILTER] Blocking stale status message for ${originId.substring(0, 8)} (${new Date(effectiveTimestamp).toISOString()} < ${new Date(lastTimestamp).toISOString()})`);
+          }
           sysMetrics.recordStaleStatusFiltered();
-          return null; // Block this stale message
+          return null;
         }
         
-        // Update the last seen timestamp
-        lastStatusTimestamps.set(originId, timestamp);
+        if (!lastStatusTimestamps.has(originId) && lastStatusTimestamps.size >= MAX_STATUS_ORIGINS) {
+          const oldestKey = lastStatusTimestamps.keys().next().value;
+          if (oldestKey) lastStatusTimestamps.delete(oldestKey);
+        }
+        lastStatusTimestamps.set(originId, effectiveTimestamp);
       }
     } catch (error) {
-      // If parsing fails, let it through (don't block non-JSON status messages)
-      console.debug(`[FILTER] Failed to parse status message for timestamp check:`, error);
+      if (isDebug) {
+        console.debug(`[FILTER] Failed to parse status message for timestamp check:`, error);
+      }
     }
   }
   
-  // Only filter for LIMITED role subscribers (role 3)
+  // Only filter for LIMITED role subscribers (role 3), caching the filtered Buffer in WeakMap
   if (clientType === ClientType.SUBSCRIBER && role === SubscriberRole.LIMITED) {
-    // Filter status messages (meshcore/*/status) to remove stats, model, and firmware_version
-    if (packet.topic.endsWith('/status') && packet.payload && packet.payload.length > 0) {
-      try {
-        const message = JSON.parse(packet.payload.toString());
-        
-        // Track if we need to filter anything
-        let filtered = false;
-        
-        // Remove the stats object if it exists
-        if (message.stats) {
-          delete message.stats;
-          filtered = true;
-        }
-        
-        // Remove model if it exists
-        if (message.model !== undefined) {
-          delete message.model;
-          filtered = true;
-        }
-        
-        // Remove firmware_version if it exists
-        if (message.firmware_version !== undefined) {
-          delete message.firmware_version;
-          filtered = true;
-        }
-        
-        // Only create new packet if we actually filtered something
-        if (filtered) {
-          return {
-            ...packet,
-            payload: Buffer.from(JSON.stringify(message))
-          };
-        }
-      } catch (error) {
-        // If JSON parsing fails, just return the original packet
-        console.debug(`[FILTER] Failed to parse status message for filtering:`, error);
+    const isStatus = packet.topic.endsWith('/status');
+    const isPackets = !isStatus && packet.topic.endsWith('/packets');
+
+    if ((isStatus || isPackets) && packet.payload && packet.payload.length > 0) {
+      const payloadBuf = ensureBuffer(packet.payload);
+      const cachedPayload = limitedPayloadCache.get(payloadBuf);
+      if (cachedPayload !== undefined) {
+        return cachedPayload === payloadBuf ? packet : { ...packet, payload: cachedPayload };
       }
-    }
-    
-    // Filter packet messages (meshcore/*/packets) to remove SNR, RSSI, score
-    if (packet.topic.endsWith('/packets') && packet.payload && packet.payload.length > 0) {
+
       try {
-        const message = JSON.parse(packet.payload.toString());
-        
-        // Remove radio metrics if they exist
-        let filtered = false;
-        if (message.SNR !== undefined) {
-          delete message.SNR;
-          filtered = true;
+        const message = getParsedJson(payloadBuf);
+        if (message && typeof message === 'object') {
+          if (isStatus) {
+            if (
+              message.stats !== undefined ||
+              message.model !== undefined ||
+              message.firmware_version !== undefined
+            ) {
+              const copy = { ...message };
+              delete copy.stats;
+              delete copy.model;
+              delete copy.firmware_version;
+              const filteredBuf = Buffer.from(JSON.stringify(copy));
+              limitedPayloadCache.set(payloadBuf, filteredBuf);
+              return { ...packet, payload: filteredBuf };
+            }
+          } else if (isPackets) {
+            if (
+              message.SNR !== undefined ||
+              message.RSSI !== undefined ||
+              message.score !== undefined
+            ) {
+              const copy = { ...message };
+              delete copy.SNR;
+              delete copy.RSSI;
+              delete copy.score;
+              const filteredBuf = Buffer.from(JSON.stringify(copy));
+              limitedPayloadCache.set(payloadBuf, filteredBuf);
+              return { ...packet, payload: filteredBuf };
+            }
+          }
         }
-        if (message.RSSI !== undefined) {
-          delete message.RSSI;
-          filtered = true;
-        }
-        if (message.score !== undefined) {
-          delete message.score;
-          filtered = true;
-        }
-        
-        // Only create new packet if we actually filtered something
-        if (filtered) {
-          return {
-            ...packet,
-            payload: Buffer.from(JSON.stringify(message))
-          };
-        }
+        // Cache original payload reference when no fields needed stripping
+        limitedPayloadCache.set(payloadBuf, payloadBuf);
       } catch (error) {
-        // If JSON parsing fails, just return the original packet
-        console.debug(`[FILTER] Failed to parse packet message for filtering:`, error);
+        if (isDebug) {
+          console.debug(`[FILTER] Failed to parse message for Role 3 filtering:`, error);
+        }
       }
     }
   }
   
-  // No filtering needed - return original packet
   return packet;
 };
 
@@ -825,16 +1168,15 @@ aedes.on('client', (client) => {
   }
   
   const logPrefix = getClientLogPrefix(client);
-  console.log(`${logPrefix} [CLIENT] Connected`);
-  console.log(`${logPrefix} [CLIENT] Connection details - conn exists: ${!!(client as any).conn}, clientIP: ${(client as any).conn?.clientIP}`);
+  console.log(`${logPrefix} [CLIENT] Connected (IP: ${(client as any).conn?.clientIP || 'unknown'})`);
   
   // Track when this client connected for disconnect timing and $SYS metrics
   (client as any).connectedAt = Date.now();
   sysMetrics.recordClientConnected((aedes as any).connectedClients || 1);
   
-  // Hook into the client's stream close event to see WHO closed it
+  // Hook into the client's stream close event when debug logging is enabled
   const stream = (client as any).stream;
-  if (stream) {
+  if (stream && isDebug) {
     const originalClose = stream.close?.bind(stream);
     const originalDestroy = stream.destroy?.bind(stream);
     
@@ -858,31 +1200,51 @@ aedes.on('clientDisconnect', (client) => {
   console.log(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
   sysMetrics.recordClientDisconnected();
   
-  // Log additional info to debug why this client disconnected
   if (client) {
-    console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
+    if (isDebug) {
+      console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
+    }
     
-    // Clean up subscriber connection tracking
+    // Clean up subscriber/peer account connection tracking
     const clientType = (client as any).clientType;
     const username = (client as any).username;
-    if (clientType === ClientType.SUBSCRIBER && username) {
+    if ((clientType === ClientType.SUBSCRIBER || clientType === ClientType.PEER) && username) {
       const activeConns = subscriberActiveConnections.get(username);
       if (activeConns) {
         activeConns.delete(client.id);
         const maxConn = subscriberMaxConnections.get(username) || subscriberConfig.defaultMaxConnections;
-        console.log(`${logPrefix} [CLIENT] Subscriber connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
+        console.log(`${logPrefix} [CLIENT] Connection removed (${username}, connections: ${activeConns.size}/${maxConn})`);
       }
     }
   }
 });
 
 aedes.on('publish', (packet, client) => {
+  // Ignore silently dropped packets
+  if (packet.topic === '$drop') {
+    return;
+  }
+
   sysMetrics.recordPublish(packet.topic, packet.payload.length, Boolean(packet.retain), Boolean(client));
-  if (client) {
-    const logPrefix = getClientLogPrefix(client);
-    console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
-  } else if (!packet.topic.startsWith('$SYS/')) {
-    console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
+
+  // Strict Origin-Only Peer Forwarding:
+  // ONLY forward packets published directly by local observers (ClientType.PUBLISHER)
+  // NEVER forward packets received from another peer broker (ClientType.PEER)
+  if (
+    peerBridgeManager &&
+    client &&
+    (client as any).clientType === ClientType.PUBLISHER
+  ) {
+    peerBridgeManager.forwardLocalPacket(packet);
+  }
+
+  if (isDebug) {
+    if (client) {
+      const logPrefix = getClientLogPrefix(client);
+      console.log(`${logPrefix} [PUBLISH] ${packet.topic} (${packet.payload.length} bytes)`);
+    } else if (!packet.topic.startsWith('$SYS/')) {
+      console.log(`[PUBLISH] Internal -> ${packet.topic} (${packet.payload.length} bytes)`);
+    }
   }
 });
 
@@ -891,7 +1253,6 @@ aedes.on('subscribe', (subscriptions, client) => {
   console.log(`${logPrefix} [SUBSCRIBE] Attempting to subscribe to: ${subscriptions.map(s => s.topic).join(', ')}`);
 });
 
-// Log when client sends DISCONNECT packet (graceful disconnect)
 aedes.on('clientError', (client, err) => {
   const logPrefix = getClientLogPrefix(client);
   console.log(`${logPrefix} [ERROR] Client error: ${err.message}`);
@@ -918,13 +1279,17 @@ const httpServer = createServer((req, res) => {
     }
 
     if (HTTP_REDIRECT_URL) {
-      console.log(`[HTTP] Non-WebSocket request from ${clientIP}, redirecting to ${HTTP_REDIRECT_URL}`);
+      if (isDebug) {
+        console.log(`[HTTP] Non-WebSocket request from ${clientIP}, redirecting to ${HTTP_REDIRECT_URL}`);
+      }
       res.writeHead(302, { 'Location': HTTP_REDIRECT_URL });
       res.end();
       return;
     }
 
-    console.log(`[HTTP] Non-WebSocket status request from ${clientIP}`);
+    if (isDebug) {
+      console.log(`[HTTP] Non-WebSocket status request from ${clientIP}`);
+    }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', service: 'MeshCore MQTT Broker' }));
     return;
@@ -944,154 +1309,154 @@ wsServer.on('connection', (ws, req) => {
     // Check if IP is blocked
     if (rateLimiter.isBlocked(clientIP)) {
       console.log(`[RATE_LIMIT] Rejecting connection from blocked IP: ${clientIP}`);
-      // Terminate immediately without trying to send a close frame
       ws.terminate();
       return;
     }
     
-    console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
+    if (isDebug) {
+      console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
+    }
   
-  // Enable WebSocket ping/pong to keep connection alive
-  ws.on('ping', (data) => {
-    console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
-    ws.pong(data);
-  });
-  
-  ws.on('pong', () => {
-    console.log(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
-  });
-  
-  // Handle WebSocket errors
-  ws.on('error', (error) => {
-    // Log other WebSocket errors
-    console.error(`[WEBSOCKET] Error from ${clientIP}:`, error.message);
-  });
-  
-  // Create per-connection MQTT packet validator with headroom for topic and header bytes
-  const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
-
-  // Create a duplex stream from the WebSocket
-  const stream = new Duplex({
-    read() {
-      // Resume WebSocket reads when consumer is ready for more data
-      if (ws.readyState === ws.OPEN) {
-        ws.resume();
+    // Enable WebSocket ping/pong to keep connection alive
+    ws.on('ping', (data) => {
+      if (isDebug) {
+        console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
       }
-    },
-    write(chunk, encoding, callback) {
-      if (ws.readyState === ws.OPEN) {
-        // Log MQTT PINGRESP packets (0xD0 = PINGRESP)
-        if (chunk instanceof Buffer && chunk.length >= 2 && chunk[0] === 0xD0) {
-          const clientInfo = (stream as any).client;
-          if (clientInfo) {
-            const logPrefix = getClientLogPrefix(clientInfo);
-            console.log(`${logPrefix} [MQTT] Sending PINGRESP (PONG) to client`);
-          } else {
-            console.log(`[MQTT] Sending PINGRESP (PONG) to unauthenticated client`);
-          }
+      ws.pong(data);
+    });
+    
+    ws.on('pong', () => {
+      if (isDebug) {
+        console.log(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
+      }
+    });
+    
+    // Handle WebSocket errors
+    ws.on('error', (error) => {
+      console.error('[WEBSOCKET] Error from %s: %s', clientIP, error.message);
+    });
+    
+    // Create per-connection MQTT packet validator with headroom for topic and header bytes
+    const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
+
+    // Create a duplex stream from the WebSocket
+    const stream = new Duplex({
+      read() {
+        if (ws.readyState === ws.OPEN) {
+          ws.resume();
         }
-        
-        ws.send(chunk, (error) => {
-          // Suppress EPIPE errors - they're expected when client disconnects
-          if (error && (error as any).code !== 'EPIPE') {
+      },
+      write(chunk, encoding, callback) {
+        if (ws.readyState === ws.OPEN) {
+          if (isDebug && chunk instanceof Buffer && chunk.length >= 2 && chunk[0] === 0xD0) {
             const clientInfo = (stream as any).client;
             if (clientInfo) {
               const logPrefix = getClientLogPrefix(clientInfo);
-              console.error(`${logPrefix} [WEBSOCKET] Send error:`, error);
+              console.log(`${logPrefix} [MQTT] Sending PINGRESP (PONG) to client`);
             } else {
-              console.error('[WEBSOCKET] Send error:', error);
+              console.log(`[MQTT] Sending PINGRESP (PONG) to unauthenticated client`);
             }
           }
-          callback(error);
-        });
-      } else {
-        callback(new Error('WebSocket not open'));
-      }
-    }
-  });
-
-  // Forward WebSocket messages to the stream with validation and backpressure handling
-  ws.on('message', (data) => {
-    const buf = Buffer.isBuffer(data)
-      ? data
-      : Array.isArray(data)
-        ? Buffer.concat(data)
-        : Buffer.from(data);
-
-    // Validate MQTT packet size before buffering to prevent memory exhaustion
-    const valErr = packetValidator.processChunk(buf);
-    if (valErr) {
-      const clientInfo = (stream as any).client;
-      const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
-      console.log(`${logPrefix} [MQTT] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
-      ws.terminate();
-      stream.destroy();
-      return;
-    }
-
-    // Log MQTT PINGREQ packets (0xC0 = PINGREQ) with client identifier
-    if (buf.length >= 2 && buf[0] === 0xC0) {
-      const clientInfo = (stream as any).client;
-      if (clientInfo) {
-        const logPrefix = getClientLogPrefix(clientInfo);
-        console.log(`${logPrefix} [MQTT] Received PINGREQ (PING) from client`);
-      } else {
-        console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
-      }
-    }
-    const canAcceptMore = stream.push(buf);
-    if (!canAcceptMore && ws.readyState === ws.OPEN) {
-      // Pause incoming WebSocket reads when duplex buffer is full
-      ws.pause();
-    }
-  });
-
-  // Store client IP and transport on stream for logging and $SYS metrics
-  (stream as any).clientIP = clientIP;
-  (stream as any).transport = 'websocket';
-  (stream as any).authenticated = false;
-  
-  // Handle WebSocket close
-  ws.on('close', (code, reason) => {
-    const clientInfo = (stream as any).client;
-    const wasAuthenticated = (stream as any).authenticated;
-    
-    // Check if client properly authenticated (has clientType set)
-    const hasValidAuth = clientInfo && (clientInfo as any).clientType;
-    
-    if (hasValidAuth) {
-      const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
-    } else {
-      // Unauthenticated or invalid client - count as failed connection
-      console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
-      
-      if (!wasAuthenticated) {
-        const blocked = rateLimiter.recordFailure(clientIP);
-        if (blocked) {
-          console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+          
+          ws.send(chunk, (error) => {
+            if (error && (error as any).code !== 'EPIPE') {
+              const clientInfo = (stream as any).client;
+              if (clientInfo) {
+                const logPrefix = getClientLogPrefix(clientInfo);
+                console.error(`${logPrefix} [WEBSOCKET] Send error:`, error);
+              } else {
+                console.error('[WEBSOCKET] Send error:', error);
+              }
+            }
+            callback(error);
+          });
+        } else {
+          callback(new Error('WebSocket not open'));
         }
       }
-    }
-    if (!stream.destroyed) {
-      stream.push(null);
-    }
-  });
+    });
 
-  // Handle stream end
-  stream.on('end', () => {
-    const clientInfo = (stream as any).client;
-    if (clientInfo) {
-      const logPrefix = getClientLogPrefix(clientInfo);
-      console.log(`${logPrefix} [STREAM] Stream ended, closing WebSocket`);
-    } else {
-      console.log('[STREAM] Stream ended (unauthenticated), closing WebSocket');
-    }
-    ws.close();
-  });
+    // Forward WebSocket messages to the stream with validation and backpressure handling
+    ws.on('message', (data) => {
+      const buf = Buffer.isBuffer(data)
+        ? data
+        : Array.isArray(data)
+          ? Buffer.concat(data)
+          : Buffer.from(data);
 
-  // Pass the stream to Aedes
-  aedes.handle(stream);
+      const valErr = packetValidator.processChunk(buf);
+      if (valErr) {
+        const clientInfo = (stream as any).client;
+        const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+        console.log(`${logPrefix} [MQTT] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
+        ws.terminate();
+        stream.destroy();
+        return;
+      }
+
+      if (isDebug && buf.length >= 2 && buf[0] === 0xC0) {
+        const clientInfo = (stream as any).client;
+        if (clientInfo) {
+          const logPrefix = getClientLogPrefix(clientInfo);
+          console.log(`${logPrefix} [MQTT] Received PINGREQ (PING) from client`);
+        } else {
+          console.log('[MQTT] Received PINGREQ (PING) from unauthenticated client');
+        }
+      }
+      const canAcceptMore = stream.push(buf);
+      if (!canAcceptMore && ws.readyState === ws.OPEN) {
+        ws.pause();
+      }
+    });
+
+    // Store client IP and transport on stream for logging and $SYS metrics
+    (stream as any).clientIP = clientIP;
+    (stream as any).transport = 'websocket';
+    (stream as any).authenticated = false;
+    
+    // Handle WebSocket close
+    ws.on('close', (code, reason) => {
+      const clientInfo = (stream as any).client;
+      const wasAuthenticated = (stream as any).authenticated;
+      const isTrustedPeer = Boolean((stream as any).trustedPeer);
+      const hasValidAuth = clientInfo && (clientInfo as any).clientType;
+      
+      if (hasValidAuth) {
+        if (isDebug) {
+          const logPrefix = getClientLogPrefix(clientInfo);
+          console.log(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
+        }
+      } else {
+        console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
+        
+        if (!wasAuthenticated && !isTrustedPeer) {
+          const blocked = rateLimiter.recordFailure(clientIP);
+          if (blocked) {
+            console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
+          }
+        }
+      }
+      if (!stream.destroyed) {
+        stream.push(null);
+      }
+    });
+
+    // Handle stream end
+    stream.on('end', () => {
+      if (isDebug) {
+        const clientInfo = (stream as any).client;
+        if (clientInfo) {
+          const logPrefix = getClientLogPrefix(clientInfo);
+          console.log(`${logPrefix} [STREAM] Stream ended, closing WebSocket`);
+        } else {
+          console.log('[STREAM] Stream ended (unauthenticated), closing WebSocket');
+        }
+      }
+      ws.close();
+    });
+
+    // Pass the stream to Aedes
+    aedes.handle(stream);
   } catch (error) {
     console.error('[WEBSOCKET] Error handling connection:', error);
     try {
@@ -1109,14 +1474,15 @@ if (ENABLE_TCP) {
     const rawIP = socket.remoteAddress || 'unknown';
     const clientIP = rawIP.startsWith('::ffff:') ? rawIP.slice(7) : rawIP;
 
-    // Check if IP is blocked
     if (rateLimiter.isBlocked(clientIP)) {
       console.log(`[RATE_LIMIT] Rejecting TCP connection from blocked IP: ${clientIP}`);
       socket.destroy();
       return;
     }
 
-    console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
+    if (isDebug) {
+      console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
+    }
     (socket as any).clientIP = clientIP;
     (socket as any).transport = 'tcp';
     (socket as any).authenticated = false;
@@ -1133,20 +1499,23 @@ if (ENABLE_TCP) {
     });
 
     socket.on('error', (error: Error) => {
-      console.error(`[TCP] Error from ${clientIP}:`, error.message);
+      console.error('[TCP] Error from %s: %s', clientIP, error.message);
     });
 
     socket.on('close', () => {
       const clientInfo = (socket as any).client;
       const wasAuthenticated = (socket as any).authenticated;
+      const isTrustedPeer = Boolean((socket as any).trustedPeer);
       const hasValidAuth = clientInfo && (clientInfo as any).clientType;
 
       if (hasValidAuth) {
-        const logPrefix = getClientLogPrefix(clientInfo);
-        console.log(`${logPrefix} [TCP] Connection closed from ${clientIP}`);
+        if (isDebug) {
+          const logPrefix = getClientLogPrefix(clientInfo);
+          console.log(`${logPrefix} [TCP] Connection closed from ${clientIP}`);
+        }
       } else {
         console.log(`[C:${clientInfo?.id || 'null'}] [TCP] Connection closed (unauthenticated) from ${clientIP}`);
-        if (!wasAuthenticated) {
+        if (!wasAuthenticated && !isTrustedPeer) {
           const blocked = rateLimiter.recordFailure(clientIP);
           if (blocked) {
             console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
@@ -1185,6 +1554,7 @@ httpServer.listen(WS_PORT, HOST, () => {
     console.log('HTTP Browser Redirect:      Disabled (serving 200 OK status)');
   }
   console.log(`$SYS Telemetry Interval:    ${mqttConfig.sysIntervalMs}ms (Admin-only, retained)`);
+  console.log(`Log Level:                  ${mqttConfig.logLevel}`);
   console.log('');
   console.log('Authentication Modes:');
   console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
@@ -1198,6 +1568,15 @@ httpServer.listen(WS_PORT, HOST, () => {
   if (EXPECTED_AUDIENCE) {
     console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
   }
+  if (peerConfig.peers.length > 0 || (peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.size > 0)) {
+    console.log('');
+    console.log('  3. Peer Broker Interconnect (Origin-Only Forwarding):');
+    console.log(`     Outbound Peers: ${peerConfig.peers.length}`);
+    console.log(`     Authorized Inbound Peer Keys: ${peerConfig.authorizedPeerKeys?.size || 0}`);
+    if (peerIdentity) {
+      console.log(`     Local Peer Public Key: ${peerIdentity.publicKeyHex}`);
+    }
+  }
   console.log('');
   console.log('Ready to accept connections...');
 });
@@ -1209,6 +1588,9 @@ function shutdown(): void {
   isShuttingDown = true;
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
   sysMetrics.stop();
+  if (peerBridgeManager) {
+    peerBridgeManager.shutdown();
+  }
   if (tcpServer) {
     tcpServer.close();
   }

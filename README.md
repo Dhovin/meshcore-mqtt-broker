@@ -9,10 +9,11 @@ A WebSocket-based MQTT broker with MeshCore Ed25519 public key authentication, r
 - **WebSocket MQTT**: Fast, reliable MQTT over WebSockets on port `8883` (with 1 MB frame limit, streaming MQTT packet size validation, and bidirectional duplex backpressure)
 - **Optional TCP MQTT**: Standard raw MQTT on port `1883` for Mosquitto bridges or internal forwarders
 - **Public Key Authentication**: Ed25519 JWT authentication for publishers using MeshCore public keys (`v1_{PUBLIC_KEY}`)
-- **Role-Based Subscribers**: Configurable accounts (Admin, Full Access, Limited) with timing-safe password verification and per-account concurrent connection limits
+- **Role-Based Subscribers**: Configurable accounts (Admin, Full Access, Limited, Peer) with timing-safe password verification and per-account concurrent connection limits
+- **Multi-Peer Origin-Only Forwarding**: Connect brokers in multi-peer topologies (e.g., `Broker A -> B & C`, `Broker C -> B`) using Ed25519 JWTs (`AUTHORIZED_PEERS`) or Role 4 credentials; brokers forward **only** local observer data and never re-forward peer-received data, with cross-path packet deduplication
 - **Remote Serial Access**: Bidirectional support for admin-issued `/serial/commands` and publisher-signed `/serial/responses`
-- **Rich `$SYS/broker/#` Telemetry**: Retained JSON & scalar metrics updated every 10 seconds for Role 1 (`admin`) subscribers in **MQTT Explorer** (uptime, memory/CPU, connected publishers by IATA region, subscriber account usage, rolling 1m/5m traffic rates, blocked IPs, and muted/anomalous publishers)
-- **Abuse Detection & Trust Telemetry**: Token-bucket rate tracking, SHA-256 duplicate packet detection, raw LoRa packet size validation, 24h IATA region change limits, SQLite state persistence with 7-day retention pruning, and retained `/internal` admin telemetry
+- **Rich `$SYS/broker/#` Telemetry**: Retained JSON & scalar metrics updated every 10 seconds for Role 1 (`admin`) subscribers in **MQTT Explorer** (uptime, memory/CPU, connected publishers by IATA region, subscriber account usage, peer bridge status, rolling 1m/5m traffic rates, blocked IPs, and active violators in temporary mute timeout)
+- **Abuse Detection & 4-Hour Temporary Mute Timeout**: $O(1)$ ring-buffer rate tracking, SHA-256 duplicate packet detection, raw LoRa packet size validation, 24h IATA region change limits, configurable temporary mute timeout (`ABUSE_MUTE_DURATION_MS`, default 4 hours), batched transactional SQLite persistence, and retained `/internal` admin telemetry
 - **Connection Rate Limiting**: IP-based rate limiter (10 failed/unauthenticated attempts in 60s blocks IP for 5 minutes) across HTTP, WebSocket, and TCP listeners
 - **Production-Ready Docker**: Pre-built multi-arch containers (`linux/amd64` and `linux/arm64`) on GHCR with automatic `PUID`/`PGID` privilege dropping and `/health` (`/healthz`) endpoints
 
@@ -190,10 +191,15 @@ Examples:
 2. **`{PUBLIC_KEY}`**:
    - Must be 64 hexadecimal characters matching the publisher's authenticated public key (normalized to uppercase).
    - Mismatched or malformed public keys in the topic are rejected and **immediately disconnect the client**.
-3. **Standard Subtopic Payloads (`packets`, `status`, etc.)**:
+3. **Allowed Publisher Subtopics & Payload Validation (`packets`, `status`, `neighbors`, `raw`, `serial/responses`)**:
+   - Publishers are permitted to publish to subtopics in the allowlist: `packets`, `status`, `neighbors`, `raw`, and `serial/responses`.
+   - Publishes to unrecognized subtopics or direct client publishes to `/internal` are **silently dropped** without disconnecting the observer socket (avoiding client reconnect storms).
    - Payloads must not exceed `MQTT_MAX_PACKET_BYTES` (default: `65536` bytes / 64 KB).
-   - Must be valid UTF-8 JSON containing an `origin_id` field matching the authenticated `PUBLIC_KEY` (case-insensitive).
-4. **Special Subtopic Behaviors**:
+   - Standard subtopics (`packets`, `status`, `neighbors`, `raw`) must be valid UTF-8 JSON containing an `origin_id` field matching the authenticated `PUBLIC_KEY` (case-insensitive).
+4. **Peer Broker Trust Model & Rate Limiting**:
+   - Authorized peer brokers (`AUTHORIZED_PEERS` Ed25519 public keys or Role 4 `PEER` accounts) are **trusted broker-to-broker links** that forward validated observer telemetry (`packets`, `status`, `neighbors`, `raw`) on behalf of their local observers (`origin_id` must match the `{PUBLIC_KEY}` in the topic). Only peer keys and credentials under trusted administrative control should be added to `AUTHORIZED_PEERS` or Role 4 accounts.
+   - Inbound peer traffic is rate-limited per peer identity via `PEER_RATE_LIMIT_PER_SEC` (default: `500` msg/s, with burst capacity set to `max(PEER_QUEUE_MAX_SIZE, 2 * PEER_RATE_LIMIT_PER_SEC)` so a full reconnect backlog drain is accepted without loss), while outbound queue draining is paced to `PEER_RATE_LIMIT_PER_SEC`. Peer-forwarded traffic does not charge the individual observer's local rate-limit bucket or duplicate-flood mute counter (preventing reconnect queue drains from muting active observers).
+5. **Special Subtopic Behaviors**:
    - **`/status` (`meshcore/{IATA}/{PUBLIC_KEY}/status`)**:
      - **Retain Flag Stripping**: Any `retain: true` flag on `/status` messages (including Last Will and Testament / LWT offline messages) is automatically stripped so stale status payloads are never retained.
      - **Stale Status / LWT Race Protection**: The broker tracks the latest `timestamp` per `origin_id` on `/status` messages and drops out-of-order status messages with an older timestamp than already seen.
@@ -238,7 +244,11 @@ This hybrid layout is optimized for **MQTT Explorer**:
 | `$SYS/broker/clients/connected` | Number | Currently connected clients |
 | `$SYS/broker/clients/maximum` | Number | Peak concurrent connected clients since startup |
 | `$SYS/broker/clients/publishers` | Number | Currently connected MeshCore publishers |
+| `$SYS/broker/clients/peers` | Number | Currently connected inbound peer brokers |
 | `$SYS/broker/clients/subscribers` | Number | Currently connected subscribers |
+| `$SYS/broker/peers` | JSON | Inbound connected peer count and outbound peer bridge status (`connected`, `queued`, `queuedBytes`, `forwarded`, `dropped`, `url`) |
+| `$SYS/broker/peers/inbound_connected` | Number | Currently connected inbound peer brokers |
+| `$SYS/broker/peers/outbound_count` | Number | Configured outbound peer bridges |
 | `$SYS/broker/clients/websocket` | Number | Active WebSocket connections |
 | `$SYS/broker/clients/tcp` | Number | Active plain TCP connections |
 | `$SYS/broker/clients/total_connections` | Number | Lifetime connections since startup |
@@ -258,6 +268,8 @@ This hybrid layout is optimized for **MQTT Explorer**:
 | `$SYS/broker/traffic/rate/bytes_per_sec_5m` | Number | Rolling 5-minute throughput (`bytes/s`) |
 | `$SYS/broker/traffic/by_subtopic/*` | Number | Individual counters for `packets`, `status`, `serial_commands`, `serial_responses`, and `internal` |
 | `$SYS/broker/traffic/stale_status_filtered` | Number | Out-of-order `/status` (LWT race) messages blocked |
+| `$SYS/broker/traffic/duplicates_filtered` | Number | Cross-path duplicate packets filtered across peer/dual-connected paths |
+| `$SYS/broker/traffic/peer_rate_limited` | Number | Inbound peer packets dropped due to exceeding `PEER_RATE_LIMIT_PER_SEC` |
 | `$SYS/broker/security` | JSON | Combined security telemetry: auth failures, unauthorized publishes, IP rate limiter, and abuse detector summary |
 | `$SYS/broker/security/auth_failures` | Number | Total failed authentication attempts |
 | `$SYS/broker/security/unauthorized_publishes` | Number | Total denied publish attempts |
@@ -265,7 +277,8 @@ This hybrid layout is optimized for **MQTT Explorer**:
 | `$SYS/broker/security/rate_limiter/blocked_ips_count` | Number | Currently blocked IP count |
 | `$SYS/broker/security/rate_limiter/tracked_ips_count` | Number | Currently tracked failing IP count |
 | `$SYS/broker/security/rate_limiter/total_blocked_attempts` | Number | Total connection/HTTP attempts rejected due to IP blocks |
-| `$SYS/broker/security/abuse_detector` | JSON | Abuse detector summary including top flagged/muted/`would_mute` publishers |
+| `$SYS/broker/security/abuse_detector` | JSON | Abuse detector summary including `muteDurationSeconds`, `violators`, and top flagged publishers |
+| `$SYS/broker/security/abuse_detector/violators` | JSON | Active violators currently in temporary timeout (`muted` or `would_mute`) with `mutedUntil` and `remainingMuteSeconds` |
 | `$SYS/broker/security/abuse_detector/muted_count` | Number | Publishers currently in `'muted'` status (`ABUSE_ENFORCEMENT_ENABLED=true`) |
 | `$SYS/broker/security/abuse_detector/would_mute_count` | Number | Publishers in `'would_mute'` status (`ABUSE_ENFORCEMENT_ENABLED=false`) |
 | `$SYS/broker/security/abuse_detector/anomalies_total` | Number | Total anomalies across tracked publishers |
@@ -321,21 +334,30 @@ cp .env.example .env
 | `HTTP_REDIRECT_URL` | No | `""` | Optional URL to redirect (`302`) non-WebSocket HTTP requests (except `/health` & `/healthz`) |
 | `MQTT_MAX_PACKET_BYTES` | No | `65536` | Maximum allowed MQTT publish payload size in bytes (`MqttStreamValidator` allows `+4096` bytes headroom for headers/topic) |
 | `MQTT_SYS_INTERVAL_MS` | No | `10000` | Interval (`ms`) between retained `$SYS/broker/#` telemetry updates (default: 10 seconds) |
+| `LOG_LEVEL` | No | `info` | Logging verbosity (`info` or `debug`) |
 | `PUID` | No *(Docker only)* | `1000` | UID used by `docker-entrypoint.sh` for `/data` ownership and privilege drop |
 | `PGID` | No *(Docker only)* | `1000` | GID used by `docker-entrypoint.sh` for `/data` ownership and privilege drop |
 
-### Subscriber Variables
+### Subscriber & Peer Variables
 
 | Variable | Required in `.env` | Default | Description |
 | :--- | :---: | :--- | :--- |
 | `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` | **Yes** | `2` | Default max concurrent connections per subscriber username |
-| `SUBSCRIBER_1`, `SUBSCRIBER_2`, ... | No | — | Sequential subscriber accounts in format `username:password:role:maxConnections` |
+| `SUBSCRIBER_1`, `SUBSCRIBER_2`, ... | No | — | Sequential accounts in format `username:password:role:maxConnections` (`role`: `1`=Admin, `2`=Full, `3`=Limited, `4`=Peer) |
+| `PEER_PRIVATE_KEY` | No | `""` | Optional 64-char or 128-char hex Ed25519 private key for outbound peer JWT signing (auto-generated in `/data/peer-identity.json` if omitted) |
+| `AUTHORIZED_PEERS` | No | `""` | Comma-separated 64-char hex Ed25519 public keys of inbound peer brokers authorized to publish |
+| `PEER_1`, `PEER_2`, ... | No | — | Outbound peer targets: `ws(s)://host:port\|targetAudience` (Ed25519 JWT) or `ws(s)://host:port\|username\|password` (Role 4) |
+| `PEER_QUEUE_MAX_SIZE` | No | `5000` | Maximum queued packets per outbound peer during disconnects |
+| `PEER_QUEUE_MAX_BYTES` | No | `8388608` | Maximum queued bytes per outbound peer (`8 MiB`) |
+| `PEER_QUEUE_TTL_MS` | No | `600000` | Maximum packet age in outbound peer queue (`10 min`) |
+| `PEER_RATE_LIMIT_PER_SEC` | No | `500` | Outbound drain rate & inbound sustained msg/s limit per peer (burst `max(PEER_QUEUE_MAX_SIZE, 2x)`) |
 
 ### Abuse Detection & Persistence Variables
 
 | Variable | Required in `.env` | Default | Description |
 | :--- | :---: | :--- | :--- |
-| `ABUSE_ENFORCEMENT_ENABLED` | **Yes** | `false` | Mark offending clients as `'muted'` in trust state when thresholds are exceeded |
+| `ABUSE_ENFORCEMENT_ENABLED` | **Yes** | `false` | Silently drop packets from muted violators during their timeout when `true` |
+| `ABUSE_MUTE_DURATION_MS` | No | `14400000` | Temporary mute timeout duration (`ms`, default 4 hours) before automatic unmute |
 | `ABUSE_DUPLICATE_WINDOW_SIZE` | **Yes** | `100` | Max number of recent unique packet SHA-256 hashes retained per client |
 | `ABUSE_DUPLICATE_WINDOW_MS` | **Yes** | `300000` | Sliding window (`ms`) to retain packet hashes for duplicate checks (5 min) |
 | `ABUSE_DUPLICATE_THRESHOLD` | **Yes** | `10` | Base duplicate threshold configuration parameter |
