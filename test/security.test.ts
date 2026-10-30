@@ -285,6 +285,84 @@ describe('AbuseDetector: Built-in node:sqlite Persistence & Summary Telemetry', 
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('enforces temporary mute timeout, lists violators in getAllStats() / $SYS, and auto-unmutes when timeout expires', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-mute-timeout-test-'));
+    const dbPath = join(tempDir, 'abuse.db');
+    const config = {
+      duplicateWindowSize: 100,
+      duplicateWindowMs: 300000,
+      duplicateThreshold: 10,
+      maxDuplicatesPerPacket: 2,
+      duplicateRateThreshold: 0.3,
+      duplicateRateWindowMs: 300000,
+      bucketCapacity: 20,
+      bucketRefillRate: 3,
+      maxPacketSize: 255,
+      maxTopicsPerDay: 3,
+      anomalyThreshold: 1,
+      maxIataChanges24h: 3,
+      topicHistorySize: 50,
+      topicHistoryWindowMs: 86400000,
+      persistencePath: dbPath,
+      persistenceIntervalMs: 300000,
+      stateRetentionMs: 604800000,
+      enforcementEnabled: true,
+      muteDurationMs: 80, // 80ms timeout for fast unit test
+    };
+
+    try {
+      const pubKey = 'C'.repeat(64);
+      const detector = new AbuseDetector(config);
+      detector.initializeClient(pubKey, `v1_${pubKey}`, '192.0.2.10');
+      const state = detector.getClientStats(pubKey)!;
+      detector.checkIataChange(state, 'SEA');
+
+      // 1. Trigger anomaly -> mutes client for 80ms
+      const oversizedHex = 'FF'.repeat(300);
+      const allowed1 = detector.recordPacket(
+        { publicKey: pubKey },
+        { payload: Buffer.from(JSON.stringify({ origin_id: pubKey, raw: oversizedHex })) }
+      );
+      assert.strictEqual(allowed1, false, 'Packet triggering mute with enforcementEnabled=true should be silenced');
+      assert.strictEqual(state.status, 'muted');
+      assert.ok(state.mutedUntil && state.mutedUntil > Date.now());
+
+      // 2. Verify violator is listed in getAllStats().violators
+      const statsDuringMute = detector.getAllStats();
+      assert.strictEqual(statsDuringMute.mutedPublishersCount, 1);
+      assert.strictEqual(statsDuringMute.violators.length, 1);
+      assert.strictEqual(statsDuringMute.violators[0].publicKey, pubKey);
+      assert.strictEqual(statsDuringMute.violators[0].status, 'muted');
+      assert.ok(statsDuringMute.violators[0].mutedUntil! > 0);
+
+      // 3. Subsequent normal packet during timeout is also silenced
+      const allowed2 = detector.recordPacket(
+        { publicKey: pubKey },
+        { payload: Buffer.from(JSON.stringify({ origin_id: pubKey, data: 'normal-during-mute' })) }
+      );
+      assert.strictEqual(allowed2, false);
+      assert.strictEqual(state.totalPacketsSilenced, 2);
+
+      // 4. Wait for 80ms timeout to expire -> next packet auto-restores client to 'allowed'
+      await new Promise((r) => setTimeout(r, 100));
+      const allowed3 = detector.recordPacket(
+        { publicKey: pubKey },
+        { payload: Buffer.from(JSON.stringify({ origin_id: pubKey, data: 'normal-after-expiry' })) }
+      );
+      assert.strictEqual(allowed3, true, 'Client should automatically unmute after muteDurationMs expires');
+      assert.strictEqual(state.status, 'allowed');
+      assert.strictEqual(state.mutedUntil, undefined);
+
+      const statsAfterExpiry = detector.getAllStats();
+      assert.strictEqual(statsAfterExpiry.mutedPublishersCount, 0);
+      assert.strictEqual(statsAfterExpiry.violators.length, 0);
+
+      detector.shutdown();
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('$SYS Telemetry: SysMetricsCollector', () => {

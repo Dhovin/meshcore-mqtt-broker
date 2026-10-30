@@ -24,6 +24,14 @@ export interface SysMetricsOptions {
   tcpEnabled: boolean;
   tcpPort: number;
   intervalMs?: number;
+  getPeerStats?: () => Record<string, {
+    connected: boolean;
+    queued: number;
+    queuedBytes: number;
+    forwarded: number;
+    dropped: number;
+    url: string;
+  }>;
 }
 
 export class SysMetricsCollector {
@@ -38,6 +46,7 @@ export class SysMetricsCollector {
   private readonly intervalMs: number;
   private readonly startedAtMs: number;
   private readonly startedAtIso: string;
+  private readonly getPeerStats?: SysMetricsOptions['getPeerStats'];
 
   private timer?: NodeJS.Timeout;
   private lastCpuUsage = process.cpuUsage();
@@ -52,6 +61,7 @@ export class SysMetricsCollector {
   private authFailures = 0;
   private unauthorizedPublishes = 0;
   private staleStatusFiltered = 0;
+  private duplicatesFiltered = 0;
 
   // Traffic counters
   private totalMessagesReceived = 0;
@@ -86,6 +96,7 @@ export class SysMetricsCollector {
     this.tcpEnabled = options.tcpEnabled;
     this.tcpPort = options.tcpPort;
     this.intervalMs = options.intervalMs ?? 10000;
+    this.getPeerStats = options.getPeerStats;
     this.startedAtMs = Date.now();
     this.startedAtIso = new Date(this.startedAtMs).toISOString();
 
@@ -162,6 +173,13 @@ export class SysMetricsCollector {
    */
   public recordStaleStatusFiltered(): void {
     this.staleStatusFiltered++;
+  }
+
+  /**
+   * Record a dropped cross-path duplicate packet
+   */
+  public recordDuplicateFiltered(): void {
+    this.duplicatesFiltered++;
   }
 
   /**
@@ -302,6 +320,7 @@ export class SysMetricsCollector {
     let connectedClients = 0;
     let connectedPublishers = 0;
     let connectedSubscribers = 0;
+    let connectedPeers = 0;
     let adminSubscribers = 0;
     let fullAccessSubscribers = 0;
     let limitedSubscribers = 0;
@@ -352,6 +371,8 @@ export class SysMetricsCollector {
         if (client.role === 1) adminSubscribers++;
         else if (client.role === 2) fullAccessSubscribers++;
         else limitedSubscribers++;
+      } else if (client.clientType === 'peer') {
+        connectedPeers++;
       }
     }
 
@@ -371,6 +392,7 @@ export class SysMetricsCollector {
     // 3. Abuse detector & regional summary (single-pass in AbuseDetector)
     const abuseSummary = this.abuseDetector.getAllStats();
     const rateLimiterStats = this.rateLimiter.getStats();
+    const outboundPeerStats = this.getPeerStats ? this.getPeerStats() : {};
 
     // Merge connected publishers per IATA with 1h/tracked stats from AbuseDetector
     const allIatas = new Set<string>([
@@ -440,6 +462,7 @@ export class SysMetricsCollector {
       totalConnections: this.totalConnections,
       totalDisconnects: this.totalDisconnects,
       publishers: connectedPublishers,
+      peers: connectedPeers,
       subscribers: {
         total: connectedSubscribers,
         byRole: {
@@ -464,6 +487,7 @@ export class SysMetricsCollector {
       rate: rates,
       bySubtopic: { ...this.subtopicCounts },
       staleStatusFiltered: this.staleStatusFiltered,
+      duplicatesFiltered: this.duplicatesFiltered,
     };
 
     const securityJson = {
@@ -473,6 +497,7 @@ export class SysMetricsCollector {
       rateLimiter: rateLimiterStats,
       abuseDetector: {
         enforcementEnabled: abuseSummary.enforcementEnabled,
+        muteDurationSeconds: abuseSummary.muteDurationSeconds,
         trackedPublishers: abuseSummary.trackedPublishers,
         mutedPublishersCount: abuseSummary.mutedPublishersCount,
         wouldMutePublishersCount: abuseSummary.wouldMutePublishersCount,
@@ -481,8 +506,16 @@ export class SysMetricsCollector {
         totalPacketsSilenced: abuseSummary.totalPacketsSilenced,
         totalDuplicates: abuseSummary.totalDuplicates,
         totalAnomalies: abuseSummary.totalAnomalies,
+        violators: abuseSummary.violators,
         flaggedPublishers: abuseSummary.flaggedPublishers,
       },
+    };
+
+    const peersJson = {
+      timestamp: nowMs,
+      inboundConnectedPeers: connectedPeers,
+      outboundPeersCount: Object.keys(outboundPeerStats).length,
+      outbound: outboundPeerStats,
     };
 
     const regionsJson = {
@@ -501,6 +534,7 @@ export class SysMetricsCollector {
         connected: connectedClients,
         maximum: this.maximumClients,
         publishers: connectedPublishers,
+        peers: connectedPeers,
         subscribers: connectedSubscribers,
         websocket: wsConnections,
         tcp: tcpConnections,
@@ -518,12 +552,14 @@ export class SysMetricsCollector {
         bytesReceived: this.totalBytesReceived,
         messagesPerSec1m: rates.messagesPerSec1m,
         bytesPerSec1m: rates.bytesPerSec1m,
+        duplicatesFiltered: this.duplicatesFiltered,
       },
       security: {
         authFailures: this.authFailures,
         blockedIPs: rateLimiterStats.blockedIPCount,
         mutedPublishers: abuseSummary.mutedPublishersCount,
         wouldMutePublishers: abuseSummary.wouldMutePublishersCount,
+        violatorsCount: abuseSummary.violators.length,
         totalAnomalies: abuseSummary.totalAnomalies,
       },
       system: {
@@ -557,12 +593,18 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/clients/connected', String(connectedClients));
     this.publishRetained('$SYS/broker/clients/maximum', String(this.maximumClients));
     this.publishRetained('$SYS/broker/clients/publishers', String(connectedPublishers));
+    this.publishRetained('$SYS/broker/clients/peers', String(connectedPeers));
     this.publishRetained('$SYS/broker/clients/subscribers', String(connectedSubscribers));
     this.publishRetained('$SYS/broker/clients/websocket', String(wsConnections));
     this.publishRetained('$SYS/broker/clients/tcp', String(tcpConnections));
     this.publishRetained('$SYS/broker/clients/total_connections', String(this.totalConnections));
     this.publishRetained('$SYS/broker/clients/total_disconnects', String(this.totalDisconnects));
     this.publishRetained('$SYS/broker/clients/subscribers_by_account', JSON.stringify(subscribersByAccount));
+
+    // Peers topics
+    this.publishRetained('$SYS/broker/peers', JSON.stringify(peersJson));
+    this.publishRetained('$SYS/broker/peers/inbound_connected', String(connectedPeers));
+    this.publishRetained('$SYS/broker/peers/outbound_count', String(Object.keys(outboundPeerStats).length));
 
     // Regional topics
     this.publishRetained('$SYS/broker/regions', JSON.stringify(regionsJson));
@@ -599,6 +641,7 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/traffic/by_subtopic/serial_responses', String(this.subtopicCounts.serial_responses));
     this.publishRetained('$SYS/broker/traffic/by_subtopic/internal', String(this.subtopicCounts.internal));
     this.publishRetained('$SYS/broker/traffic/stale_status_filtered', String(this.staleStatusFiltered));
+    this.publishRetained('$SYS/broker/traffic/duplicates_filtered', String(this.duplicatesFiltered));
 
     // Security topics
     this.publishRetained('$SYS/broker/security', JSON.stringify(securityJson));
@@ -609,6 +652,7 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/security/rate_limiter/tracked_ips_count', String(rateLimiterStats.trackedIPCount));
     this.publishRetained('$SYS/broker/security/rate_limiter/total_blocked_attempts', String(rateLimiterStats.totalBlockedAttempts));
     this.publishRetained('$SYS/broker/security/abuse_detector', JSON.stringify(securityJson.abuseDetector));
+    this.publishRetained('$SYS/broker/security/abuse_detector/violators', JSON.stringify(abuseSummary.violators));
     this.publishRetained('$SYS/broker/security/abuse_detector/muted_count', String(abuseSummary.mutedPublishersCount));
     this.publishRetained('$SYS/broker/security/abuse_detector/would_mute_count', String(abuseSummary.wouldMutePublishersCount));
     this.publishRetained('$SYS/broker/security/abuse_detector/anomalies_total', String(abuseSummary.totalAnomalies));

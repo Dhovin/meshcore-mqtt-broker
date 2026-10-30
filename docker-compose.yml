@@ -6,6 +6,11 @@ services:
       dockerfile: Dockerfile
     container_name: meshcore-mqtt-broker
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "${MQTT_WS_PORT:-8883}:${MQTT_WS_PORT:-8883}"
       # Plain TCP MQTT (unencrypted): bind to localhost or private network only, or terminate TLS in front
@@ -16,6 +21,7 @@ services:
     environment:
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       - MQTT_WS_PORT=${MQTT_WS_PORT:-8883}
       - ENABLE_TCP_MQTT=${ENABLE_TCP_MQTT:-false}
       - MQTT_TCP_PORT=${MQTT_TCP_PORT:-1883}
@@ -24,13 +30,24 @@ services:
       - HTTP_REDIRECT_URL=${HTTP_REDIRECT_URL:-}
       - MQTT_MAX_PACKET_BYTES=${MQTT_MAX_PACKET_BYTES:-65536}
       - MQTT_SYS_INTERVAL_MS=${MQTT_SYS_INTERVAL_MS:-10000}
-      # Subscribe-Only Accounts (format: username:password:role:maxConnections)
-      # Role: 1=admin, 2=full_access, 3=limited (default). maxConnections: override count or default
+      # Subscribe-Only & Peer Accounts (format: username:password:role:maxConnections)
+      # Role: 1=admin, 2=full_access, 3=limited (default), 4=peer. maxConnections: override count or default
       - SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=${SUBSCRIBER_MAX_CONNECTIONS_DEFAULT:-2}
       - SUBSCRIBER_1=${SUBSCRIBER_1:-}
       - SUBSCRIBER_2=${SUBSCRIBER_2:-}
       - SUBSCRIBER_3=${SUBSCRIBER_3:-}
+      # Optional Multi-Peer Interconnect (Origin-Only Forwarding)
+      - PEER_PRIVATE_KEY=${PEER_PRIVATE_KEY:-}
+      - AUTHORIZED_PEERS=${AUTHORIZED_PEERS:-}
+      - PEER_QUEUE_MAX_SIZE=${PEER_QUEUE_MAX_SIZE:-5000}
+      - PEER_QUEUE_MAX_BYTES=${PEER_QUEUE_MAX_BYTES:-8388608}
+      - PEER_QUEUE_TTL_MS=${PEER_QUEUE_TTL_MS:-600000}
+      - PEER_1=${PEER_1:-}
+      - PEER_2=${PEER_2:-}
+      - PEER_3=${PEER_3:-}
+      # Abuse Detection & Temporary Mute Timeout
       - ABUSE_ENFORCEMENT_ENABLED=${ABUSE_ENFORCEMENT_ENABLED:-false}
+      - ABUSE_MUTE_DURATION_MS=${ABUSE_MUTE_DURATION_MS:-14400000}
       - ABUSE_DUPLICATE_WINDOW_SIZE=${ABUSE_DUPLICATE_WINDOW_SIZE:-100}
       - ABUSE_DUPLICATE_WINDOW_MS=${ABUSE_DUPLICATE_WINDOW_MS:-300000}
       - ABUSE_DUPLICATE_THRESHOLD=${ABUSE_DUPLICATE_THRESHOLD:-10}

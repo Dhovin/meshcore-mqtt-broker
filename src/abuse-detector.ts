@@ -7,11 +7,12 @@ import { DatabaseSync } from 'node:sqlite';
 // keepalives. anomalyCount (a counter) still tracks the lifetime total.
 const MAX_STORED_ANOMALIES = 100;
 
-// Peak-rate tracking window. Only the last 10s (current rate) and last hour
-// (peak decay) are ever read, so anything past an hour is dead weight.
+// Peak-rate decay window (1 hour)
 const RATE_WINDOW_MS = 3600000;
-// Defensive bound on the per-client timestamp array (10 pkt/s for a full hour)
-const MAX_RATE_WINDOW_ENTRIES = 36000;
+// 10 one-second buckets for O(1) rolling 10-second packet rate calculation
+const RECENT_RATE_BUCKETS = 10;
+// Default 4-hour temporary mute timeout (4 * 60 * 60 * 1000 ms)
+const DEFAULT_MUTE_DURATION_MS = 14400000;
 
 // ============================================================================
 // Type Definitions
@@ -31,9 +32,10 @@ export interface ClientTrustState {
     connectionCount: number;
   }[];
   
-  // Status
+  // Status & temporary timeout tracking
   status: 'allowed' | 'muted' | 'would_mute';
   mutedAt?: number;
+  mutedUntil?: number;
   muteReason?: string;
   
   // Rate limiting (leaky bucket)
@@ -106,9 +108,14 @@ export interface ClientTrustState {
   avgPacketSize: number;
   peakRateObserved: number;
   peakRateWindow: {
-    version: number;             // Schema version (increment to reset)
-    packets: number[];
+    version: number;             // Schema version (v3 uses O(1) 1s buckets instead of timestamp array)
+    packets: number[];           // Kept empty in v3 so SQLite saves stay compact
     windowMs: number;
+  };
+  // In-memory O(1) 1-second bucket ring buffer for 10s current rate calculation
+  recentRateBuckets?: {
+    epochs: Float64Array;
+    counts: Uint16Array;
   };
 }
 
@@ -144,12 +151,31 @@ export interface AbuseConfig {
   // evicted from memory and disk on each save so the store stays bounded by active clients.
   stateRetentionMs: number;
 
-  // Enforcement
+  // Enforcement & temporary timeout duration
   enforcementEnabled: boolean;
+  muteDurationMs?: number;           // Temporary mute duration in ms (default: 4 hours = 14400000)
+}
+
+export interface FlaggedPublisherEntry {
+  publicKeyPrefix: string;
+  publicKey: string;
+  currentIata?: string;
+  status: 'allowed' | 'muted' | 'would_mute';
+  muteReason?: string;
+  mutedAt?: number;
+  mutedUntil?: number;
+  remainingMuteSeconds?: number;
+  anomalyCount: number;
+  duplicateCount: number;
+  totalPacketsReceived: number;
+  totalPacketsSilenced: number;
+  peakRateObserved: number;
+  lastPacketAt: number;
 }
 
 export interface AbuseDetectorSummary {
   enforcementEnabled: boolean;
+  muteDurationSeconds: number;
   trackedPublishers: number;
   mutedPublishersCount: number;
   wouldMutePublishersCount: number;
@@ -163,19 +189,8 @@ export interface AbuseDetectorSummary {
     trackedPublishers: number;
     totalPacketsReceived: number;
   }>;
-  flaggedPublishers: {
-    publicKeyPrefix: string;
-    publicKey: string;
-    currentIata?: string;
-    status: 'allowed' | 'muted' | 'would_mute';
-    muteReason?: string;
-    mutedAt?: number;
-    anomalyCount: number;
-    duplicateCount: number;
-    totalPacketsReceived: number;
-    peakRateObserved: number;
-    lastPacketAt: number;
-  }[];
+  flaggedPublishers: FlaggedPublisherEntry[];
+  violators: FlaggedPublisherEntry[];
 }
 
 interface SerializedTrustState {
@@ -190,6 +205,7 @@ interface SerializedTrustState {
   }[];
   status: 'allowed' | 'muted' | 'would_mute';
   mutedAt?: number;
+  mutedUntil?: number;
   muteReason?: string;
   tokenBucket: {
     tokens: number;
@@ -242,6 +258,7 @@ interface SerializedTrustState {
 
 export class AbuseDetector {
   private config: AbuseConfig;
+  private muteDurationMs: number;
   private clients: Map<string, ClientTrustState> = new Map();
   private db: DatabaseSync;
   private persistenceInterval?: NodeJS.Timeout;
@@ -255,6 +272,7 @@ export class AbuseDetector {
 
   constructor(config: AbuseConfig) {
     this.config = config;
+    this.muteDurationMs = config.muteDurationMs ?? DEFAULT_MUTE_DURATION_MS;
     
     // Initialize SQLite database
     this.db = new DatabaseSync(config.persistencePath);
@@ -265,8 +283,11 @@ export class AbuseDetector {
     this.persistenceInterval = setInterval(() => {
       this.saveToDatabase();
     }, config.persistenceIntervalMs);
+    if (this.persistenceInterval.unref) {
+      this.persistenceInterval.unref();
+    }
     
-    console.log(`[ABUSE] Initialized with persistence at: ${config.persistencePath}`);
+    console.log(`[ABUSE] Initialized with persistence at: ${config.persistencePath} (muteDuration: ${Math.round(this.muteDurationMs / 60000)}m)`);
   }
 
   private initDatabase(): void {
@@ -286,7 +307,8 @@ export class AbuseDetector {
   private loadFromDatabase(): void {
     // Only load state for clients active within the retention window, and iterate rather than
     // materialising the whole table, so a large historical DB can never exhaust the heap on load.
-    const cutoff = Date.now() - this.config.stateRetentionMs;
+    const now = Date.now();
+    const cutoff = now - this.config.stateRetentionMs;
     const stmt = this.db.prepare('SELECT public_key, state_json FROM trust_states WHERE updated_at >= ?');
 
     let loaded = 0;
@@ -294,6 +316,7 @@ export class AbuseDetector {
       try {
         const serialized: SerializedTrustState = JSON.parse(row.state_json);
         const state = this.deserializeTrustState(serialized);
+        this.checkAndExpireMute(state, now);
         this.clients.set(row.public_key, state);
         loaded++;
 
@@ -308,40 +331,57 @@ export class AbuseDetector {
     console.log(`[ABUSE] Loaded ${loaded} trust states from database`);
   }
 
-  private saveToDatabase(): void {
+  public saveToDatabase(): void {
     const stmt = this.db.prepare(`
       INSERT OR REPLACE INTO trust_states (public_key, state_json, updated_at)
       VALUES (?, ?, ?)
     `);
 
     const del = this.db.prepare('DELETE FROM trust_states WHERE public_key = ?');
+    const sweep = this.db.prepare('DELETE FROM trust_states WHERE updated_at < ?');
     const now = Date.now();
     const cutoff = now - this.config.stateRetentionMs;
     let saved = 0;
     let evicted = 0;
 
-    for (const [publicKey, state] of this.clients.entries()) {
-      // Evict clients idle beyond the retention window from memory and disk so the store stays
-      // bounded by active clients rather than every client ever seen.
-      if (state.lastPacketAt < cutoff) {
-        this.clients.delete(publicKey);
-        del.run(publicKey);
-        evicted++;
-        continue;
-      }
-      try {
-        const serialized = this.serializeTrustState(state);
-        // Persist the client's real last-activity time as updated_at so retention (load filter
-        // and the delete below) is driven by activity, not by when the row was last written.
-        stmt.run(publicKey, JSON.stringify(serialized), state.lastPacketAt);
-        saved++;
-      } catch (error) {
-        console.error(`[ABUSE] Failed to save trust state for ${publicKey}:`, error);
-      }
-    }
+    // Wrap all per-client writes in a single SQLite transaction so 200+ observers
+    // commit in a single disk flush (< 5 ms) instead of 200 individual fsyncs.
+    try {
+      this.db.exec('BEGIN TRANSACTION');
 
-    // Sweep any orphaned rows for clients not currently tracked in memory (bounds disk).
-    this.db.prepare('DELETE FROM trust_states WHERE updated_at < ?').run(cutoff);
+      for (const [publicKey, state] of this.clients.entries()) {
+        // Evict clients idle beyond the retention window from memory and disk so the store stays
+        // bounded by active clients rather than every client ever seen.
+        if (state.lastPacketAt < cutoff) {
+          this.clients.delete(publicKey);
+          del.run(publicKey);
+          evicted++;
+          continue;
+        }
+        try {
+          this.checkAndExpireMute(state, now);
+          const serialized = this.serializeTrustState(state);
+          // Persist the client's real last-activity time as updated_at so retention (load filter
+          // and the delete below) is driven by activity, not by when the row was last written.
+          stmt.run(publicKey, JSON.stringify(serialized), state.lastPacketAt);
+          saved++;
+        } catch (error) {
+          console.error(`[ABUSE] Failed to save trust state for ${publicKey}:`, error);
+        }
+      }
+
+      // Sweep any orphaned rows for clients not currently tracked in memory (bounds disk).
+      sweep.run(cutoff);
+
+      this.db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Ignore rollback error
+      }
+      console.error('[ABUSE] Transaction failed while saving trust states:', error);
+    }
 
     if (saved > 0 || evicted > 0) {
       console.log(`[ABUSE] Saved ${saved} trust states to database (evicted ${evicted} stale)`);
@@ -356,6 +396,7 @@ export class AbuseDetector {
       recentIPs: state.recentIPs,
       status: state.status,
       mutedAt: state.mutedAt,
+      mutedUntil: state.mutedUntil,
       muteReason: state.muteReason,
       tokenBucket: state.tokenBucket,
       recentPacketHashes: state.recentPacketHashes,
@@ -375,14 +416,22 @@ export class AbuseDetector {
       lastPacketAt: state.lastPacketAt,
       avgPacketSize: state.avgPacketSize,
       peakRateObserved: state.peakRateObserved,
-      peakRateWindow: state.peakRateWindow,
+      peakRateWindow: {
+        version: 3,
+        packets: [], // Do not persist per-packet timestamps in v3
+        windowMs: RATE_WINDOW_MS,
+      },
     };
   }
 
   private deserializeTrustState(serialized: SerializedTrustState): ClientTrustState {
-    const state = {
+    const state: ClientTrustState = {
       ...serialized,
       uniqueTopics: new Set(serialized.uniqueTopics),
+      recentRateBuckets: {
+        epochs: new Float64Array(RECENT_RATE_BUCKETS),
+        counts: new Uint16Array(RECENT_RATE_BUCKETS),
+      },
     };
     
     // Initialize duplicateRateWindow if missing
@@ -395,26 +444,20 @@ export class AbuseDetector {
       };
     }
     
-    // Initialize peakRateWindow if missing
+    // Initialize peakRateWindow if missing or upgrade v1/v2 -> v3 (drop persisted timestamp arrays)
     if (!state.peakRateWindow || !state.peakRateWindow.version || state.peakRateWindow.version < 1) {
-      state.peakRateWindow = {
-        version: 2,
-        packets: [],
-        windowMs: RATE_WINDOW_MS,
-      };
       state.peakRateObserved = 0; // Reset bad old values
     }
+    state.peakRateWindow = {
+      version: 3,
+      packets: [],
+      windowMs: RATE_WINDOW_MS,
+    };
 
-    // v1 -> v2: shrink the rate window from 24h to 1h. Rate checks only ever
-    // read the last 10s (current rate) and last hour (peak decay), but the 24h
-    // window stored a timestamp per packet - the bulk of the persisted state.
-    if (state.peakRateWindow.version < 2) {
-      const cutoff = Date.now() - RATE_WINDOW_MS;
-      state.peakRateWindow.packets = state.peakRateWindow.packets.filter(
-        (timestamp: number) => timestamp > cutoff
-      );
-      state.peakRateWindow.windowMs = RATE_WINDOW_MS;
-      state.peakRateWindow.version = 2;
+    // Backfill mutedUntil for legacy muted states persisted before mutedUntil existed
+    if ((state.status === 'muted' || state.status === 'would_mute') && !state.mutedUntil) {
+      const baseTime = state.mutedAt || state.lastPacketAt || Date.now();
+      state.mutedUntil = baseTime + this.muteDurationMs;
     }
     
     // Reset clock tracking if version is old or missing
@@ -449,13 +492,55 @@ export class AbuseDetector {
   }
 
   // ============================================================================
+  // Temporary Timeout (Mute) Lifecycle
+  // ============================================================================
+
+  /**
+   * Check whether a client's temporary mute / would_mute timeout has expired,
+   * and restore the client to 'allowed' with refreshed rate/anomaly windows.
+   */
+  public checkAndExpireMute(state: ClientTrustState, now: number = Date.now()): void {
+    if (state.status !== 'muted' && state.status !== 'would_mute') {
+      return;
+    }
+
+    const mutedUntil = state.mutedUntil ?? ((state.mutedAt ?? now) + this.muteDurationMs);
+    state.mutedUntil = mutedUntil;
+
+    if (now >= mutedUntil) {
+      const prevStatus = state.status;
+      if (prevStatus === 'muted' && this.stats.totalClientsMuted > 0) {
+        this.stats.totalClientsMuted--;
+      }
+
+      state.status = 'allowed';
+      state.mutedAt = undefined;
+      state.mutedUntil = undefined;
+      state.muteReason = undefined;
+
+      // Reset token bucket and short-term anomaly/duplicate counters so the observer
+      // is not immediately re-muted on its first packet after the timeout expires.
+      state.tokenBucket.tokens = state.tokenBucket.capacity;
+      state.tokenBucket.lastRefill = now;
+      state.anomalyCount = 0;
+      state.duplicateRateWindow.totalPackets = 0;
+      state.duplicateRateWindow.duplicatePackets = 0;
+      state.duplicateRateWindow.windowStart = now;
+
+      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] Temporary timeout expired (was ${prevStatus}), restored to allowed`);
+    }
+  }
+
+  // ============================================================================
   // Client Management
   // ============================================================================
 
   public initializeClient(publicKey: string, username: string, clientIP?: string): void {
-    if (this.clients.has(publicKey)) {
-      const existing = this.clients.get(publicKey)!;
-      console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Client reconnected (status: ${existing.status})`);
+    const normalizedKey = publicKey.toUpperCase();
+    if (this.clients.has(normalizedKey)) {
+      const existing = this.clients.get(normalizedKey)!;
+      this.checkAndExpireMute(existing, Date.now());
+      console.log(`[ABUSE] [${normalizedKey.substring(0, 8)}] Client reconnected (status: ${existing.status})`);
       existing.connectedAt = Date.now();
       
       // Update IP tracking
@@ -466,15 +551,16 @@ export class AbuseDetector {
       return;
     }
 
+    const now = Date.now();
     const state: ClientTrustState = {
-      publicKey,
+      publicKey: normalizedKey,
       username,
-      connectedAt: Date.now(),
+      connectedAt: now,
       recentIPs: [],
       status: 'allowed',
       tokenBucket: {
         tokens: this.config.bucketCapacity,
-        lastRefill: Date.now(),
+        lastRefill: now,
         capacity: this.config.bucketCapacity,
         refillRate: this.config.bucketRefillRate,
       },
@@ -483,7 +569,7 @@ export class AbuseDetector {
       duplicateRateWindow: {
         totalPackets: 0,
         duplicatePackets: 0,
-        windowStart: Date.now(),
+        windowStart: now,
         windowMs: this.config.duplicateRateWindowMs,
       },
       totalPacketsReceived: 0,
@@ -499,17 +585,21 @@ export class AbuseDetector {
       },
       anomalyCount: 0,
       anomalies: [],
-      lastPacketAt: Date.now(),
+      lastPacketAt: now,
       avgPacketSize: 0,
       peakRateObserved: 0,
       peakRateWindow: {
-        version: 2,
+        version: 3,
         packets: [],
         windowMs: RATE_WINDOW_MS,
       },
+      recentRateBuckets: {
+        epochs: new Float64Array(RECENT_RATE_BUCKETS),
+        counts: new Uint16Array(RECENT_RATE_BUCKETS),
+      },
     };
 
-    this.clients.set(publicKey, state);
+    this.clients.set(normalizedKey, state);
     this.stats.totalClientsConnected++;
     
     // Record initial IP
@@ -517,7 +607,7 @@ export class AbuseDetector {
       this.recordIP(state, clientIP);
     }
     
-    console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Initialized trust tracking`);
+    console.log(`[ABUSE] [${normalizedKey.substring(0, 8)}] Initialized trust tracking`);
   }
 
   private recordIP(state: ClientTrustState, ip: string): void {
@@ -545,14 +635,19 @@ export class AbuseDetector {
   }
 
   public getClientStats(publicKey: string): ClientTrustState | undefined {
-    return this.clients.get(publicKey);
+    const state = this.clients.get(publicKey.toUpperCase());
+    if (state) {
+      this.checkAndExpireMute(state, Date.now());
+    }
+    return state;
   }
 
   /**
    * Compute a single-pass, memory-bounded summary of abuse detection and regional activity for $SYS telemetry
    */
   public getAllStats(maxFlagged: number = 25): AbuseDetectorSummary {
-    const oneHourAgo = Date.now() - RATE_WINDOW_MS;
+    const now = Date.now();
+    const oneHourAgo = now - RATE_WINDOW_MS;
     let mutedPublishersCount = 0;
     let wouldMutePublishersCount = 0;
     let anomalousPublishersCount = 0;
@@ -562,9 +657,12 @@ export class AbuseDetector {
     let totalAnomalies = 0;
 
     const activeByIata1h: AbuseDetectorSummary['activeByIata1h'] = {};
-    const flaggedCandidates: AbuseDetectorSummary['flaggedPublishers'] = [];
+    const flaggedCandidates: FlaggedPublisherEntry[] = [];
+    const violators: FlaggedPublisherEntry[] = [];
 
     for (const state of this.clients.values()) {
+      this.checkAndExpireMute(state, now);
+
       totalPacketsReceived += state.totalPacketsReceived;
       totalPacketsSilenced += state.totalPacketsSilenced;
       totalDuplicates += state.duplicateCount;
@@ -594,26 +692,41 @@ export class AbuseDetector {
       }
 
       if (state.status !== 'allowed' || state.anomalyCount > 0) {
-        flaggedCandidates.push({
+        const remainingMuteSeconds =
+          state.mutedUntil && state.mutedUntil > now
+            ? Math.ceil((state.mutedUntil - now) / 1000)
+            : undefined;
+
+        const entry: FlaggedPublisherEntry = {
           publicKeyPrefix: state.publicKey.substring(0, 8),
           publicKey: state.publicKey,
           currentIata: state.currentIata,
           status: state.status,
           muteReason: state.muteReason,
           mutedAt: state.mutedAt,
+          mutedUntil: state.mutedUntil,
+          remainingMuteSeconds,
           anomalyCount: state.anomalyCount,
           duplicateCount: state.duplicateCount,
           totalPacketsReceived: state.totalPacketsReceived,
+          totalPacketsSilenced: state.totalPacketsSilenced,
           peakRateObserved: Math.round(state.peakRateObserved * 100) / 100,
           lastPacketAt: state.lastPacketAt,
-        });
+        };
+
+        flaggedCandidates.push(entry);
+        if (state.status === 'muted' || state.status === 'would_mute') {
+          violators.push(entry);
+        }
       }
     }
 
     flaggedCandidates.sort((a, b) => b.anomalyCount - a.anomalyCount || b.lastPacketAt - a.lastPacketAt);
+    violators.sort((a, b) => (b.mutedAt || 0) - (a.mutedAt || 0) || b.lastPacketAt - a.lastPacketAt);
 
     return {
       enforcementEnabled: this.config.enforcementEnabled,
+      muteDurationSeconds: Math.round(this.muteDurationMs / 1000),
       trackedPublishers: this.clients.size,
       mutedPublishersCount,
       wouldMutePublishersCount,
@@ -624,6 +737,7 @@ export class AbuseDetector {
       totalAnomalies,
       activeByIata1h,
       flaggedPublishers: flaggedCandidates.slice(0, maxFlagged),
+      violators: violators.slice(0, 100),
     };
   }
 
@@ -631,8 +745,12 @@ export class AbuseDetector {
   // Packet Processing
   // ============================================================================
 
-  public recordPacket(client: any, packet: any): boolean {
-    const publicKey = client.publicKey;
+  public recordPacket(clientOrKey: any, packet: any, parsedMessage?: any): boolean {
+    const rawKey = typeof clientOrKey === 'string' ? clientOrKey : clientOrKey?.publicKey;
+    if (!rawKey) {
+      return false;
+    }
+    const publicKey = rawKey.toUpperCase();
     const state = this.clients.get(publicKey);
     
     if (!state) {
@@ -641,8 +759,25 @@ export class AbuseDetector {
     }
 
     const now = Date.now();
+    this.checkAndExpireMute(state, now);
+
+    // If client is currently muted (enforcement enabled and timeout active), silence immediately
+    if (state.status === 'muted') {
+      state.totalPacketsReceived++;
+      state.totalPacketsSilenced++;
+      this.stats.totalPacketsSilenced++;
+      state.lastPacketAt = now;
+      return false;
+    }
+
+    const prevLastPacketAt = state.lastPacketAt;
     state.totalPacketsReceived++;
     state.lastPacketAt = now;
+
+    // Reset peak if no packets in last hour (O(1) decay check using prevLastPacketAt)
+    if (prevLastPacketAt > 0 && now - prevLastPacketAt > RATE_WINDOW_MS) {
+      state.peakRateObserved = 0;
+    }
 
     // Update average packet size
     const payloadSize = packet.payload.length;
@@ -651,44 +786,39 @@ export class AbuseDetector {
     } else {
       state.avgPacketSize = state.avgPacketSize * 0.9 + payloadSize * 0.1;
     }
-    
-    // Track packet rate over 24h window
-    state.peakRateWindow.packets.push(now);
-    
-    // Clean old packets outside the window
-    const windowStart = now - state.peakRateWindow.windowMs;
-    state.peakRateWindow.packets = state.peakRateWindow.packets.filter(
-      (timestamp: number) => timestamp > windowStart
-    );
-    if (state.peakRateWindow.packets.length > MAX_RATE_WINDOW_ENTRIES) {
-      state.peakRateWindow.packets = state.peakRateWindow.packets.slice(-MAX_RATE_WINDOW_ENTRIES);
+
+    // O(1) 10-second rolling rate calculation using 1-second ring buffer buckets
+    if (!state.recentRateBuckets) {
+      state.recentRateBuckets = {
+        epochs: new Float64Array(RECENT_RATE_BUCKETS),
+        counts: new Uint16Array(RECENT_RATE_BUCKETS),
+      };
     }
-    
-    // Calculate current rate (packets in last 10 seconds)
-    const tenSecondsAgo = now - 10000;
-    const recentPackets = state.peakRateWindow.packets.filter(
-      (timestamp: number) => timestamp > tenSecondsAgo
-    );
-    const currentRate = recentPackets.length / 10; // packets per second
-    
-    // Update peak if current rate is higher
+    const currentSec = Math.floor(now / 1000);
+    const slot = currentSec % RECENT_RATE_BUCKETS;
+    if (state.recentRateBuckets.epochs[slot] !== currentSec) {
+      state.recentRateBuckets.epochs[slot] = currentSec;
+      state.recentRateBuckets.counts[slot] = 1;
+    } else {
+      state.recentRateBuckets.counts[slot] += 1;
+    }
+
+    let recentPacketsCount = 0;
+    for (let i = 0; i < RECENT_RATE_BUCKETS; i++) {
+      const ageSec = currentSec - state.recentRateBuckets.epochs[i];
+      if (ageSec >= 0 && ageSec < RECENT_RATE_BUCKETS) {
+        recentPacketsCount += state.recentRateBuckets.counts[i];
+      }
+    }
+    const currentRate = recentPacketsCount / RECENT_RATE_BUCKETS; // packets per second
     if (currentRate > state.peakRateObserved) {
       state.peakRateObserved = currentRate;
     }
-    
-    // Reset peak if no packets in last hour (allows peak to decay)
-    const oneHourAgo = now - 3600000;
-    const packetsInLastHour = state.peakRateWindow.packets.filter(
-      (timestamp: number) => timestamp > oneHourAgo
-    );
-    if (packetsInLastHour.length === 0) {
-      state.peakRateObserved = 0;
-    }
 
-    // Check packet size based on raw LoRa packet data
+    // Check packet size based on raw LoRa packet data (reuse parsedMessage if provided)
     try {
-      const message = JSON.parse(packet.payload.toString('utf-8'));
-      if (message.raw) {
+      const message = parsedMessage ?? packet?._parsedJson ?? JSON.parse(packet.payload.toString('utf-8'));
+      if (message && message.raw) {
         // raw is hex string, so divide by 2 to get actual byte size
         const rawByteSize = message.raw.length / 2;
         
@@ -698,7 +828,7 @@ export class AbuseDetector {
           this.recordAnomaly(state, 'packet_size', `Raw packet size ${rawByteSize} bytes exceeds limit ${this.config.maxPacketSize}`);
         }
       }
-    } catch (error) {
+    } catch {
       // If not JSON or no raw field, skip check
     }
 
@@ -706,26 +836,46 @@ export class AbuseDetector {
     if (!this.checkRateLimit(state)) {
       console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Rate limit exceeded`);
       this.muteClient(state, 'rate_limit_exceeded');
-      return false;
+      if ((state.status as string) === 'muted') {
+        state.totalPacketsSilenced++;
+        this.stats.totalPacketsSilenced++;
+        return false;
+      }
+      return true;
     }
 
     // Check for duplicates
-    const payload = packet.payload.toString();
+    const payload = typeof packet.payload === 'string' ? packet.payload : packet.payload.toString('utf-8');
     if (!this.checkDuplicates(state, payload)) {
       console.log(`[ABUSE] [${publicKey.substring(0, 8)}] Duplicate packet detected`);
+      if ((state.status as string) === 'muted') {
+        state.totalPacketsSilenced++;
+        this.stats.totalPacketsSilenced++;
+        return false;
+      }
+      return true;
+    }
+
+    if ((state.status as string) === 'muted') {
+      state.totalPacketsSilenced++;
+      this.stats.totalPacketsSilenced++;
       return false;
     }
 
     return true;
   }
 
-  public shouldSilencePacket(client: any): boolean {
-    const publicKey = client.publicKey;
-    const state = this.clients.get(publicKey);
-    
+  public shouldSilencePacket(clientOrKey: any): boolean {
+    const rawKey = typeof clientOrKey === 'string' ? clientOrKey : clientOrKey?.publicKey;
+    if (!rawKey) {
+      return false;
+    }
+    const state = this.clients.get(rawKey.toUpperCase());
     if (!state) {
       return false;
     }
+
+    this.checkAndExpireMute(state, Date.now());
 
     if (state.status === 'muted') {
       state.totalPacketsSilenced++;
@@ -841,6 +991,7 @@ export class AbuseDetector {
 
   public checkIataChange(state: ClientTrustState, iata: string): boolean {
     const now = Date.now();
+    this.checkAndExpireMute(state, now);
     const twentyFourHoursAgo = now - 86400000;
 
     // Clean old history
@@ -919,24 +1070,32 @@ export class AbuseDetector {
   }
 
   public muteClient(state: ClientTrustState, reason: string): void {
+    const now = Date.now();
+    this.checkAndExpireMute(state, now);
+
     if (state.status === 'muted') {
       return;
     }
 
+    const mutedUntil = now + this.muteDurationMs;
+    const durationMin = Math.round(this.muteDurationMs / 60000);
+
     // Only actually mute if enforcement is enabled
     if (this.config.enforcementEnabled) {
       state.status = 'muted';
-      state.mutedAt = Date.now();
+      state.mutedAt = now;
+      state.mutedUntil = mutedUntil;
       state.muteReason = reason;
       this.stats.totalClientsMuted++;
-      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] MUTED (reason: ${reason})`);
+      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] MUTED for ${durationMin}m until ${new Date(mutedUntil).toISOString()} (reason: ${reason})`);
     } else {
       if (state.status !== 'would_mute') {
         state.status = 'would_mute';
-        state.mutedAt = Date.now();
+        state.mutedAt = now;
+        state.mutedUntil = mutedUntil;
         state.muteReason = reason;
       }
-      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] WOULD MUTE (reason: ${reason}) [enforcement disabled]`);
+      console.log(`[ABUSE] [${state.publicKey.substring(0, 8)}] WOULD MUTE for ${durationMin}m (reason: ${reason}) [enforcement disabled]`);
     }
   }
 }

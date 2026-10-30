@@ -160,7 +160,9 @@ services:
       - AUTH_EXPECTED_AUDIENCE=mqtt.yourdomain.com
       - SUBSCRIBER_1=viewer1:your-secure-password:2
       - SUBSCRIBER_2=admin:admin-password:1:10
+      - LOG_LEVEL=info
       - ABUSE_ENFORCEMENT_ENABLED=false
+      - ABUSE_MUTE_DURATION_MS=14400000
       - ABUSE_PERSISTENCE_PATH=/data/abuse-detection.db
     volumes:
       - /mnt/user/appdata/meshcore-mqtt-broker:/data
