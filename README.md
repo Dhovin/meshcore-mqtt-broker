@@ -436,6 +436,8 @@ address your-meshcore-broker-host:1883
 topic meshcore/# in 0
 remote_username viewer
 remote_password your-subscriber-password
+notifications false
+try_private false
 ```
 
 ---

@@ -651,6 +651,16 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       callback(new Error('Invalid serial/commands topic format'));
       return;
     }
+
+    // Silently ignore Mosquitto bridge state notifications ($SYS/broker/connection/<id>/state)
+    // so Mosquitto pull bridges without `notifications false` do not get disconnected
+    if (packet.topic.startsWith('$SYS/broker/connection/')) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Ignored bridge state notification from subscriber -> ${packet.topic}`);
+      }
+      dropPacketSilently(packet, callback);
+      return;
+    }
     
     console.log(`${logPrefix} [AUTHZ] ✗ Publish denied (subscriber) -> ${packet.topic}`);
     sysMetrics.recordUnauthorizedPublish();
