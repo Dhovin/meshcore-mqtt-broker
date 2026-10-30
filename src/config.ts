@@ -33,14 +33,20 @@ export function loadMqttConfig() {
       ? rawLogLevel
       : 'info';
 
-  const allowedRegions = parseAllowedRegions(process.env.ALLOWED_REGIONS, (code) => {
-    try {
-      getAirportInfo(code);
-      return true;
-    } catch {
-      return false;
-    }
-  });
+  let allowedRegions: Set<string> | null;
+  try {
+    allowedRegions = parseAllowedRegions(process.env.ALLOWED_REGIONS, (code) => {
+      try {
+        getAirportInfo(code);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  } catch (err: any) {
+    console.error(`FATAL: ${err.message}`);
+    process.exit(1);
+  }
 
   if (allowedRegions) {
     console.log(`[CONFIG] Allowed ingestion regions (${allowedRegions.size}): ${Array.from(allowedRegions).join(', ')}`);

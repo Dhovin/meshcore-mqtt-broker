@@ -227,6 +227,16 @@ function dropPacketSilently(packet: any, callback: (err?: Error | null) => void)
   callback(null);
 }
 
+// Suppress a client's LWT before closing it. Aedes only deletes the persisted will on close
+// while client.will is still set, so clearing the field alone would leave it in persistence.
+function suppressWill(client: any): void {
+  if (client.will) {
+    (aedes as any).persistence.delWill({ id: client.id, brokerId: aedes.id }, () => {});
+  }
+  client.will = null;
+  client._will = null;
+}
+
 // Inbound peer rate limiting (token bucket per authenticated peer identity)
 const peerRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
 
@@ -840,8 +850,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code: "${locationCode}"`);
         if (ALLOWED_REGIONS && (client as any).publicKey) {
           observerRegionBlocklist.block((client as any).publicKey.toUpperCase(), locationCode);
-          (client as any).will = null;
-          (client as any)._will = null;
+          suppressWill(client);
         }
         sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be a valid IATA international airport code or "test"'));
@@ -886,8 +895,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${normalizedLocation}"`
       );
       observerRegionBlocklist.block(clientPublicKey, normalizedLocation);
-      (client as any).will = null;
-      (client as any)._will = null;
+      suppressWill(client);
       packet.topic = '$drop';
       packet.retain = false;
       sysMetrics.recordUnauthorizedPublish();
@@ -1092,8 +1100,7 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
               `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${iata}"`
             );
             observerRegionBlocklist.block(clientPublicKey, iata);
-            (client as any).will = null;
-            (client as any)._will = null;
+            suppressWill(client);
             callback(new Error(`IATA region "${iata}" is not permitted on this broker`));
             client.close();
             return;

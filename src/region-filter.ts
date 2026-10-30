@@ -32,7 +32,9 @@ export interface ObserverRegionBlocklistStats {
 
 /**
  * Parse ALLOWED_REGIONS environment variable into a sanitized Set of approved region codes.
- * Returns null if ALLOWED_REGIONS is undefined, empty, or contains no valid codes (bypass mode).
+ * Returns null if ALLOWED_REGIONS is undefined or blank (bypass mode).
+ * Throws if a non-blank value contains no valid codes, so a typo (e.g. "DFW;ORD") fails closed
+ * instead of silently disabling the filter.
  */
 export function parseAllowedRegions(
   raw?: string,
@@ -75,7 +77,13 @@ export function parseAllowedRegions(
     }
   }
 
-  return approved.size > 0 ? approved : null;
+  if (approved.size === 0) {
+    throw new Error(
+      `ALLOWED_REGIONS is set but contains no valid region codes ("${trimmedRaw}"); expected comma-separated 3-letter IATA codes or "test"`
+    );
+  }
+
+  return approved;
 }
 
 /**

@@ -247,12 +247,18 @@ describe('Region Filtering: Configuration & Unit Tests', () => {
     assert.strictEqual(parseAllowedRegions(undefined), null);
     assert.strictEqual(parseAllowedRegions(''), null);
     assert.strictEqual(parseAllowedRegions('   '), null);
-    assert.strictEqual(parseAllowedRegions(' , , '), null);
 
     // When allowedRegions is null, all regions are permitted unconditionally
     assert.strictEqual(isRegionAllowed('DFW', null), true);
     assert.strictEqual(isRegionAllowed('SEA', null), true);
     assert.strictEqual(isRegionAllowed('test', null), true);
+  });
+
+  it('throws when ALLOWED_REGIONS is non-blank but contains no valid codes', () => {
+    assert.throws(() => parseAllowedRegions(' , , '), /no valid region codes/);
+    assert.throws(() => parseAllowedRegions('DFW;ORD'), /no valid region codes/);
+    assert.throws(() => parseAllowedRegions('DFW ORD'), /no valid region codes/);
+    assert.throws(() => parseAllowedRegions('XXX'), /no valid region codes/);
   });
 
   it('parses ALLOWED_REGIONS into a sanitized, trimmed, case-insensitive set', () => {
