@@ -186,6 +186,7 @@ const sysMetrics = new SysMetricsCollector({
   subscriberAccounts: subscriberAccountsMeta,
   brokerVersion,
   brokerPublicKey: peerIdentity?.publicKeyHex,
+  authorizedPeerKeysCount: peerConfig.authorizedPeerKeys?.size || 0,
   wsPort: WS_PORT,
   tcpEnabled: ENABLE_TCP,
   tcpPort: TCP_PORT,
@@ -666,7 +667,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
           `${logPrefix} [RATE_LIMIT] Dropped peer packet exceeding PEER_RATE_LIMIT_PER_SEC (${peerConfig.peerRateLimitPerSec}/s)`
         );
       }
-      sysMetrics.recordPeerRateLimited();
+      sysMetrics.recordPeerRateLimited(client);
       dropPacketSilently(packet, callback);
       return;
     }
@@ -677,6 +678,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (${validation.error})`);
       }
       sysMetrics.recordUnauthorizedPublish();
+      sysMetrics.recordInboundPeerInvalid(client);
       dropPacketSilently(packet, callback);
       return;
     }
@@ -693,6 +695,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         console.log(`${logPrefix} [DEDUP] Dropped duplicate peer packet -> ${packet.topic}`);
       }
       sysMetrics.recordDuplicateFiltered();
+      sysMetrics.recordInboundPeerDuplicate(client);
       dropPacketSilently(packet, callback);
       return;
     }
@@ -725,6 +728,8 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         }
       }
     }
+
+    sysMetrics.recordInboundPeerPublish(client, subtopic, payloadBuf.length);
 
     if (isDebug) {
       console.log(`${logPrefix} [AUTHZ] ✓ Peer publish authorized -> ${packet.topic}`);

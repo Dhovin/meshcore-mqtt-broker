@@ -269,10 +269,24 @@ This hybrid layout is optimized for **MQTT Explorer**:
 | `$SYS/broker/clients/publishers` | Number | Currently connected MeshCore publishers |
 | `$SYS/broker/clients/peers` | Number | Currently connected inbound peer brokers |
 | `$SYS/broker/clients/subscribers` | Number | Currently connected subscribers |
-| `$SYS/broker/peers` | JSON | Broker peer `publicKey`, inbound connected peer count, and outbound peer bridge status (`connected`, `queued`, `queuedBytes`, `forwarded`, `dropped`, `url`) |
+| `$SYS/broker/peers` | JSON | Full inbound & outbound peer snapshot (`publicKey`, `inbound`, `outboundTotals`, and per-peer details) |
 | `$SYS/broker/peers/public_key` | String | This broker instance's 64-character Ed25519 peer public key |
+| `$SYS/broker/peers/authorized_keys_count` | Number | Count of configured `AUTHORIZED_PEERS` public keys |
 | `$SYS/broker/peers/inbound_connected` | Number | Currently connected inbound peer brokers |
+| `$SYS/broker/peers/inbound/received_packets` | Number | Total valid packets received from inbound peers |
+| `$SYS/broker/peers/inbound/received_bytes` | Number | Total payload bytes received from inbound peers |
+| `$SYS/broker/peers/inbound/duplicates_filtered` | Number | Cross-path duplicates filtered from inbound peers |
+| `$SYS/broker/peers/inbound/rate_limited` | Number | Inbound peer packets dropped by `PEER_RATE_LIMIT_PER_SEC` |
+| `$SYS/broker/peers/inbound/invalid_dropped` | Number | Malformed or unauthorized packets dropped from inbound peers |
+| `$SYS/broker/peers/inbound/{PEER_ID}` | JSON | Detailed stats for a specific inbound peer (`connected`, `clientIp`, `uptimeSeconds`, `packetsReceived`, `bytesReceived`, `bySubtopic`, `duplicatesFiltered`, `rateLimited`) + scalar subtopics |
+| `$SYS/broker/peers/outbound_connected` | Number | Currently connected outbound peer bridges |
 | `$SYS/broker/peers/outbound_count` | Number | Configured outbound peer bridges |
+| `$SYS/broker/peers/outbound/forwarded_packets` | Number | Total packets forwarded across all outbound peers |
+| `$SYS/broker/peers/outbound/forwarded_bytes` | Number | Total bytes forwarded across all outbound peers |
+| `$SYS/broker/peers/outbound/queued_packets` | Number | Total packets currently queued across all outbound peers |
+| `$SYS/broker/peers/outbound/queued_bytes` | Number | Total bytes currently queued across all outbound peers |
+| `$SYS/broker/peers/outbound/dropped_packets` | Number | Total packets dropped across all outbound peer queues |
+| `$SYS/broker/peers/outbound/{PEER_ID}` | JSON | Detailed stats for a specific outbound peer (`connected`, `draining`, `url`, `targetAudience`, `authMode`, `uptimeSeconds`, `lastError`, `forwarded`, `forwardedBytes`, `forwardedBySubtopic`, `queued`, `dropped`, `coalescedStatus`) + scalar subtopics |
 | `$SYS/broker/clients/websocket` | Number | Active WebSocket connections |
 | `$SYS/broker/clients/tcp` | Number | Active plain TCP connections |
 | `$SYS/broker/clients/total_connections` | Number | Lifetime connections since startup |

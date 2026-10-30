@@ -13,6 +13,36 @@ export interface QueueItem {
   byteSize: number;
 }
 
+export interface OutboundPeerSubtopicCounts {
+  packets: number;
+  status: number;
+  neighbors: number;
+  raw: number;
+}
+
+export interface OutboundPeerStats {
+  connected: boolean;
+  draining: boolean;
+  url: string;
+  targetAudience: string;
+  authMode: 'ed25519_jwt' | 'role4_credentials';
+  connectedSince: string | null;
+  uptimeSeconds: number;
+  lastDisconnectedAt: string | null;
+  lastError: string | null;
+  totalConnections: number;
+  reconnectAttempts: number;
+  queued: number;
+  queuedBytes: number;
+  maxQueueSize: number;
+  maxQueueBytes: number;
+  forwarded: number;
+  forwardedBytes: number;
+  forwardedBySubtopic: OutboundPeerSubtopicCounts;
+  dropped: number;
+  coalescedStatus: number;
+}
+
 export interface PeerState {
   target: PeerTarget;
   ws: WebSocket | null;
@@ -21,7 +51,14 @@ export interface PeerState {
   queue: QueueItem[];
   queuedBytes: number;
   totalForwarded: number;
+  totalBytesForwarded: number;
+  forwardedBySubtopic: OutboundPeerSubtopicCounts;
   totalDropped: number;
+  coalescedStatus: number;
+  totalConnections: number;
+  connectedAt?: number;
+  lastDisconnectedAt?: number;
+  lastError?: string;
   reconnectAttempts: number;
   reconnectTimer?: NodeJS.Timeout;
   keepaliveTimer?: NodeJS.Timeout;
@@ -182,7 +219,11 @@ export class PeerBridgeManager {
         queue: [],
         queuedBytes: 0,
         totalForwarded: 0,
+        totalBytesForwarded: 0,
+        forwardedBySubtopic: { packets: 0, status: 0, neighbors: 0, raw: 0 },
         totalDropped: 0,
+        coalescedStatus: 0,
+        totalConnections: 0,
         reconnectAttempts: 0,
         awaitingPingresp: false,
         sendTokens: Math.max(this.peerRateLimitPerSec, DRAIN_BATCH_SLICE),
@@ -311,6 +352,9 @@ export class PeerBridgeManager {
         }
         if (packet.returnCode === 0) {
           peerState.connected = true;
+          peerState.connectedAt = Date.now();
+          peerState.totalConnections++;
+          peerState.lastError = undefined;
           peerState.reconnectAttempts = 0;
           peerState.awaitingPingresp = false;
           console.log(`${logPrefix} ✓ Connected to peer at ${target.url}`);
@@ -351,6 +395,7 @@ export class PeerBridgeManager {
           this.drainQueue(peerState);
         } else {
           authRefused = true;
+          peerState.lastError = `CONNACK refused (returnCode: ${packet.returnCode})`;
           console.error(
             `${logPrefix} ✗ Upstream refused MQTT CONNECT (returnCode: ${packet.returnCode}) — pausing retries for ${AUTH_REFUSED_BACKOFF_MS / 60000}m`
           );
@@ -419,6 +464,7 @@ export class PeerBridgeManager {
 
     ws.on('unexpected-response', (_req, res) => {
       const code = res.statusCode || 0;
+      peerState.lastError = `HTTP ${code} on WebSocket upgrade`;
       if (code === 401 || code === 403 || code === 429 || code === 508) {
         authRefused = true;
         console.error(`${logPrefix} ✗ Upstream HTTP ${code} on WebSocket upgrade — pausing retries for ${AUTH_REFUSED_BACKOFF_MS / 60000}m`);
@@ -430,6 +476,7 @@ export class PeerBridgeManager {
     });
 
     ws.on('error', (err: Error) => {
+      peerState.lastError = err.message;
       if (!this.shuttingDown && peerState.connected) {
         console.error(`${logPrefix} [ERROR] ${err.message}`);
       }
@@ -439,6 +486,8 @@ export class PeerBridgeManager {
       if (peerState.ws !== ws) return;
       const wasConnected = peerState.connected;
       peerState.connected = false;
+      peerState.connectedAt = undefined;
+      peerState.lastDisconnectedAt = Date.now();
       peerState.draining = false;
       peerState.ws = null;
       this.clearPeerTimers(peerState);
@@ -559,6 +608,11 @@ export class PeerBridgeManager {
         }
       } else {
         peerState.totalForwarded++;
+        peerState.totalBytesForwarded += payloadBuffer.length;
+        if (topic.endsWith('/packets')) peerState.forwardedBySubtopic.packets++;
+        else if (topic.endsWith('/status')) peerState.forwardedBySubtopic.status++;
+        else if (topic.endsWith('/neighbors')) peerState.forwardedBySubtopic.neighbors++;
+        else if (topic.endsWith('/raw')) peerState.forwardedBySubtopic.raw++;
         if (this.debugLog) {
           console.log(`[PEER:${peerState.target.id}] -> Forwarded ${topic} (${payloadBuffer.length} bytes)`);
         }
@@ -614,6 +668,7 @@ export class PeerBridgeManager {
               enqueuedAt: now,
               byteSize: itemBytes,
             };
+            peerState.coalescedStatus++;
             if (peerState.connected && !peerState.draining) {
               this.drainQueue(peerState);
             }
@@ -655,22 +710,31 @@ export class PeerBridgeManager {
     }
   }
 
-  public getPeerStats(): Record<
-    string,
-    { connected: boolean; queued: number; queuedBytes: number; forwarded: number; dropped: number; url: string }
-  > {
-    const stats: Record<
-      string,
-      { connected: boolean; queued: number; queuedBytes: number; forwarded: number; dropped: number; url: string }
-    > = {};
+  public getPeerStats(): Record<string, OutboundPeerStats> {
+    const now = Date.now();
+    const stats: Record<string, OutboundPeerStats> = {};
     for (const [id, state] of this.peers.entries()) {
       stats[id] = {
         connected: state.connected,
+        draining: state.draining,
+        url: state.target.url,
+        targetAudience: state.target.targetAudience || '',
+        authMode: state.target.username ? 'role4_credentials' : 'ed25519_jwt',
+        connectedSince: state.connectedAt ? new Date(state.connectedAt).toISOString() : null,
+        uptimeSeconds: state.connected && state.connectedAt ? Math.max(0, Math.floor((now - state.connectedAt) / 1000)) : 0,
+        lastDisconnectedAt: state.lastDisconnectedAt ? new Date(state.lastDisconnectedAt).toISOString() : null,
+        lastError: state.lastError ?? null,
+        totalConnections: state.totalConnections,
+        reconnectAttempts: state.reconnectAttempts,
         queued: state.queue.length,
         queuedBytes: state.queuedBytes,
+        maxQueueSize: this.maxQueueSize,
+        maxQueueBytes: this.maxQueueBytes,
         forwarded: state.totalForwarded,
+        forwardedBytes: state.totalBytesForwarded,
+        forwardedBySubtopic: { ...state.forwardedBySubtopic },
         dropped: state.totalDropped,
-        url: state.target.url,
+        coalescedStatus: state.coalescedStatus,
       };
     }
     return stats;

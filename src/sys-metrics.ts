@@ -2,6 +2,7 @@ import type Aedes from 'aedes';
 import { performance } from 'node:perf_hooks';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AbuseDetector } from './abuse-detector.js';
+import type { OutboundPeerStats } from './peer-bridge.js';
 
 // 60 buckets of 5 seconds each = 300 seconds (5 minutes) rolling window
 const BUCKET_DURATION_MS = 5000;
@@ -14,6 +15,27 @@ export interface SubscriberAccountMeta {
   activeConnections: Set<string>;
 }
 
+export interface InboundPeerRecord {
+  id: string;
+  publicKey: string | null;
+  username: string | null;
+  authMode: 'ed25519_jwt' | 'role4_credentials';
+  lastClientIp: string | null;
+  lastConnectedAt: number | null;
+  lastSeenAt: number;
+  packetsReceived: number;
+  bytesReceived: number;
+  bySubtopic: {
+    packets: number;
+    status: number;
+    neighbors: number;
+    raw: number;
+  };
+  duplicatesFiltered: number;
+  rateLimited: number;
+  invalidDropped: number;
+}
+
 export interface SysMetricsOptions {
   aedes: Aedes;
   rateLimiter: RateLimiter;
@@ -21,18 +43,12 @@ export interface SysMetricsOptions {
   subscriberAccounts: Map<string, SubscriberAccountMeta>;
   brokerVersion: string;
   brokerPublicKey?: string;
+  authorizedPeerKeysCount?: number;
   wsPort: number;
   tcpEnabled: boolean;
   tcpPort: number;
   intervalMs?: number;
-  getPeerStats?: () => Record<string, {
-    connected: boolean;
-    queued: number;
-    queuedBytes: number;
-    forwarded: number;
-    dropped: number;
-    url: string;
-  }>;
+  getPeerStats?: () => Record<string, OutboundPeerStats>;
 }
 
 export class SysMetricsCollector {
@@ -42,6 +58,7 @@ export class SysMetricsCollector {
   private readonly subscriberAccounts: Map<string, SubscriberAccountMeta>;
   private readonly versionString: string;
   private readonly brokerPublicKey?: string;
+  private readonly authorizedPeerKeysCount: number;
   private readonly wsPort: number;
   private readonly tcpEnabled: boolean;
   private readonly tcpPort: number;
@@ -65,6 +82,13 @@ export class SysMetricsCollector {
   private staleStatusFiltered = 0;
   private duplicatesFiltered = 0;
   private peerRateLimited = 0;
+
+  // Inbound peer tracking
+  private inboundPeerPacketsReceived = 0;
+  private inboundPeerBytesReceived = 0;
+  private inboundPeerDuplicatesFiltered = 0;
+  private inboundPeerInvalidDropped = 0;
+  private readonly inboundPeers = new Map<string, InboundPeerRecord>();
 
   // Traffic counters
   private totalMessagesReceived = 0;
@@ -96,6 +120,7 @@ export class SysMetricsCollector {
     this.abuseDetector = options.abuseDetector;
     this.subscriberAccounts = options.subscriberAccounts;
     this.brokerPublicKey = options.brokerPublicKey;
+    this.authorizedPeerKeysCount = options.authorizedPeerKeysCount ?? 0;
     this.wsPort = options.wsPort;
     this.tcpEnabled = options.tcpEnabled;
     this.tcpPort = options.tcpPort;
@@ -189,8 +214,82 @@ export class SysMetricsCollector {
   /**
    * Record an inbound peer packet dropped due to PEER_RATE_LIMIT_PER_SEC
    */
-  public recordPeerRateLimited(): void {
+  public recordPeerRateLimited(client?: any): void {
     this.peerRateLimited++;
+    if (client) {
+      const rec = this.getOrCreateInboundPeerRecord(client);
+      rec.rateLimited++;
+      rec.lastSeenAt = Date.now();
+    }
+  }
+
+  /**
+   * Record a valid inbound peer publish
+   */
+  public recordInboundPeerPublish(client: any, subtopic: string, payloadBytes: number): void {
+    this.inboundPeerPacketsReceived++;
+    this.inboundPeerBytesReceived += payloadBytes;
+    const rec = this.getOrCreateInboundPeerRecord(client);
+    rec.packetsReceived++;
+    rec.bytesReceived += payloadBytes;
+    rec.lastSeenAt = Date.now();
+    if (subtopic === 'packets') rec.bySubtopic.packets++;
+    else if (subtopic === 'status') rec.bySubtopic.status++;
+    else if (subtopic === 'neighbors') rec.bySubtopic.neighbors++;
+    else if (subtopic === 'raw') rec.bySubtopic.raw++;
+  }
+
+  /**
+   * Record an inbound peer packet dropped as a cross-path duplicate
+   */
+  public recordInboundPeerDuplicate(client: any): void {
+    this.inboundPeerDuplicatesFiltered++;
+    const rec = this.getOrCreateInboundPeerRecord(client);
+    rec.duplicatesFiltered++;
+    rec.lastSeenAt = Date.now();
+  }
+
+  /**
+   * Record an invalid/unauthorized packet from an inbound peer
+   */
+  public recordInboundPeerInvalid(client: any): void {
+    this.inboundPeerInvalidDropped++;
+    const rec = this.getOrCreateInboundPeerRecord(client);
+    rec.invalidDropped++;
+    rec.lastSeenAt = Date.now();
+  }
+
+  private getOrCreateInboundPeerRecord(client: any): InboundPeerRecord {
+    const pubKey: string | undefined = client?.publicKey;
+    const username: string | undefined = client?.username;
+    const id = pubKey ? pubKey.substring(0, 8) : username || client?.id || 'unknown';
+    let rec = this.inboundPeers.get(id);
+    if (!rec) {
+      if (this.inboundPeers.size >= 500) {
+        const oldestKey = this.inboundPeers.keys().next().value;
+        if (oldestKey) this.inboundPeers.delete(oldestKey);
+      }
+      rec = {
+        id,
+        publicKey: pubKey ?? null,
+        username: username ?? null,
+        authMode: pubKey ? 'ed25519_jwt' : 'role4_credentials',
+        lastClientIp: client?.conn?.clientIP ?? null,
+        lastConnectedAt: client?.connectedAt ?? Date.now(),
+        lastSeenAt: Date.now(),
+        packetsReceived: 0,
+        bytesReceived: 0,
+        bySubtopic: { packets: 0, status: 0, neighbors: 0, raw: 0 },
+        duplicatesFiltered: 0,
+        rateLimited: 0,
+        invalidDropped: 0,
+      };
+      this.inboundPeers.set(id, rec);
+    } else {
+      if (client?.conn?.clientIP) rec.lastClientIp = client.conn.clientIP;
+      if (client?.connectedAt) rec.lastConnectedAt = client.connectedAt;
+    }
+    return rec;
   }
 
   /**
@@ -340,6 +439,7 @@ export class SysMetricsCollector {
     let activeSubscriptions = 0;
 
     const connectedByIata: Record<string, string[]> = {};
+    const connectedInboundPeers = new Map<string, any>();
 
     for (const clientId of Object.keys(clientsMap)) {
       const client = clientsMap[clientId];
@@ -384,6 +484,8 @@ export class SysMetricsCollector {
         else limitedSubscribers++;
       } else if (client.clientType === 'peer') {
         connectedPeers++;
+        const rec = this.getOrCreateInboundPeerRecord(client);
+        connectedInboundPeers.set(rec.id, client);
       }
     }
 
@@ -524,12 +626,77 @@ export class SysMetricsCollector {
       },
     };
 
+    // Aggregate outbound and inbound peer stats
+    let outboundConnectedCount = 0;
+    let outboundTotalForwarded = 0;
+    let outboundTotalBytesForwarded = 0;
+    let outboundTotalQueued = 0;
+    let outboundTotalQueuedBytes = 0;
+    let outboundTotalDropped = 0;
+    let outboundTotalCoalescedStatus = 0;
+
+    for (const p of Object.values(outboundPeerStats)) {
+      if (p.connected) outboundConnectedCount++;
+      outboundTotalForwarded += p.forwarded || 0;
+      outboundTotalBytesForwarded += p.forwardedBytes || 0;
+      outboundTotalQueued += p.queued || 0;
+      outboundTotalQueuedBytes += p.queuedBytes || 0;
+      outboundTotalDropped += p.dropped || 0;
+      outboundTotalCoalescedStatus += p.coalescedStatus || 0;
+    }
+
+    const inboundPeersSnapshot: Record<string, any> = {};
+    for (const [peerId, rec] of this.inboundPeers.entries()) {
+      const liveClient = connectedInboundPeers.get(peerId);
+      const isConnected = Boolean(liveClient);
+      const connAt = liveClient?.connectedAt ?? rec.lastConnectedAt;
+      inboundPeersSnapshot[peerId] = {
+        id: rec.id,
+        publicKey: rec.publicKey,
+        username: rec.username,
+        authMode: rec.authMode,
+        connected: isConnected,
+        clientIp: liveClient?.conn?.clientIP ?? rec.lastClientIp,
+        connectedSince: isConnected && connAt ? new Date(connAt).toISOString() : null,
+        uptimeSeconds: isConnected && connAt ? Math.max(0, Math.floor((nowMs - connAt) / 1000)) : 0,
+        lastSeenAt: new Date(rec.lastSeenAt).toISOString(),
+        packetsReceived: rec.packetsReceived,
+        bytesReceived: rec.bytesReceived,
+        bySubtopic: { ...rec.bySubtopic },
+        duplicatesFiltered: rec.duplicatesFiltered,
+        rateLimited: rec.rateLimited,
+        invalidDropped: rec.invalidDropped,
+      };
+    }
+
     const peersJson = {
       timestamp: nowMs,
       publicKey: this.brokerPublicKey ?? null,
+      authorizedPeerKeysCount: this.authorizedPeerKeysCount,
       inboundConnectedPeers: connectedPeers,
       inboundRateLimited: this.peerRateLimited,
+      inbound: {
+        connectedCount: connectedPeers,
+        authorizedKeysCount: this.authorizedPeerKeysCount,
+        totalPacketsReceived: this.inboundPeerPacketsReceived,
+        totalBytesReceived: this.inboundPeerBytesReceived,
+        duplicatesFiltered: this.inboundPeerDuplicatesFiltered,
+        rateLimited: this.peerRateLimited,
+        invalidDropped: this.inboundPeerInvalidDropped,
+        peers: inboundPeersSnapshot,
+      },
+      outboundConnectedPeers: outboundConnectedCount,
       outboundPeersCount: Object.keys(outboundPeerStats).length,
+      outboundTotals: {
+        connectedCount: outboundConnectedCount,
+        configuredCount: Object.keys(outboundPeerStats).length,
+        totalForwarded: outboundTotalForwarded,
+        totalBytesForwarded: outboundTotalBytesForwarded,
+        totalQueued: outboundTotalQueued,
+        totalQueuedBytes: outboundTotalQueuedBytes,
+        totalDropped: outboundTotalDropped,
+        totalCoalescedStatus: outboundTotalCoalescedStatus,
+      },
       outbound: outboundPeerStats,
     };
 
@@ -626,8 +793,43 @@ export class SysMetricsCollector {
     if (this.brokerPublicKey) {
       this.publishRetained('$SYS/broker/peers/public_key', this.brokerPublicKey);
     }
+    this.publishRetained('$SYS/broker/peers/authorized_keys_count', String(this.authorizedPeerKeysCount));
     this.publishRetained('$SYS/broker/peers/inbound_connected', String(connectedPeers));
+    this.publishRetained('$SYS/broker/peers/inbound/received_packets', String(this.inboundPeerPacketsReceived));
+    this.publishRetained('$SYS/broker/peers/inbound/received_bytes', String(this.inboundPeerBytesReceived));
+    this.publishRetained('$SYS/broker/peers/inbound/duplicates_filtered', String(this.inboundPeerDuplicatesFiltered));
+    this.publishRetained('$SYS/broker/peers/inbound/rate_limited', String(this.peerRateLimited));
+    this.publishRetained('$SYS/broker/peers/inbound/invalid_dropped', String(this.inboundPeerInvalidDropped));
+
+    for (const [peerId, peerData] of Object.entries(inboundPeersSnapshot)) {
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}`, JSON.stringify(peerData));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/connected`, String(peerData.connected));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/received`, String(peerData.packetsReceived));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/received_bytes`, String(peerData.bytesReceived));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/duplicates_filtered`, String(peerData.duplicatesFiltered));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/rate_limited`, String(peerData.rateLimited));
+    }
+
+    this.publishRetained('$SYS/broker/peers/outbound_connected', String(outboundConnectedCount));
     this.publishRetained('$SYS/broker/peers/outbound_count', String(Object.keys(outboundPeerStats).length));
+    this.publishRetained('$SYS/broker/peers/outbound/forwarded_packets', String(outboundTotalForwarded));
+    this.publishRetained('$SYS/broker/peers/outbound/forwarded_bytes', String(outboundTotalBytesForwarded));
+    this.publishRetained('$SYS/broker/peers/outbound/queued_packets', String(outboundTotalQueued));
+    this.publishRetained('$SYS/broker/peers/outbound/queued_bytes', String(outboundTotalQueuedBytes));
+    this.publishRetained('$SYS/broker/peers/outbound/dropped_packets', String(outboundTotalDropped));
+
+    for (const [peerId, peerData] of Object.entries(outboundPeerStats)) {
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}`, JSON.stringify(peerData));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/connected`, String(peerData.connected));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/url`, peerData.url);
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/forwarded`, String(peerData.forwarded));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/forwarded_bytes`, String(peerData.forwardedBytes));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/queued`, String(peerData.queued));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/queued_bytes`, String(peerData.queuedBytes));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/dropped`, String(peerData.dropped));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/reconnect_attempts`, String(peerData.reconnectAttempts));
+      this.publishRetained(`$SYS/broker/peers/outbound/${peerId}/uptime`, String(peerData.uptimeSeconds));
+    }
 
     // Regional topics
     this.publishRetained('$SYS/broker/regions', JSON.stringify(regionsJson));
