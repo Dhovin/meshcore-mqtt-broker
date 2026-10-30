@@ -26,6 +26,7 @@ export interface PeerState {
   reconnectTimer?: NodeJS.Timeout;
   keepaliveTimer?: NodeJS.Timeout;
   tokenRefreshTimer?: NodeJS.Timeout;
+  connackTimer?: NodeJS.Timeout;
   awaitingPingresp: boolean;
 }
 
@@ -38,6 +39,8 @@ const MAX_WS_BUFFERED_BYTES = 512 * 1024;
 const DRAIN_BATCH_SLICE = 32;
 // Keepalive interval (25s keeps Cloudflare Tunnels and NAT sessions open)
 const KEEPALIVE_INTERVAL_MS = 25000;
+// Timeout waiting for MQTT CONNACK after WebSocket upgrade
+const CONNACK_TIMEOUT_MS = 10000;
 // Cooldown when upstream explicitly refuses authentication
 const AUTH_REFUSED_BACKOFF_MS = 300000;
 
@@ -191,6 +194,10 @@ export class PeerBridgeManager {
       clearInterval(peerState.tokenRefreshTimer);
       peerState.tokenRefreshTimer = undefined;
     }
+    if (peerState.connackTimer) {
+      clearTimeout(peerState.connackTimer);
+      peerState.connackTimer = undefined;
+    }
   }
 
   private scheduleReconnect(peerState: PeerState, overrideDelayMs?: number): void {
@@ -271,6 +278,10 @@ export class PeerBridgeManager {
       if (this.shuttingDown || peerState.ws !== ws) return;
 
       if (packet.cmd === 'connack') {
+        if (peerState.connackTimer) {
+          clearTimeout(peerState.connackTimer);
+          peerState.connackTimer = undefined;
+        }
         if (packet.returnCode === 0) {
           peerState.connected = true;
           peerState.reconnectAttempts = 0;
@@ -350,9 +361,21 @@ export class PeerBridgeManager {
         password: Buffer.from(password, 'utf-8'),
       });
 
+      peerState.connackTimer = setTimeout(() => {
+        peerState.connackTimer = undefined;
+        if (!peerState.connected && peerState.ws === ws) {
+          console.warn(`${logPrefix} Timed out waiting for CONNACK (${CONNACK_TIMEOUT_MS}ms); terminating socket`);
+          ws.terminate();
+        }
+      }, CONNACK_TIMEOUT_MS);
+      if (peerState.connackTimer.unref) {
+        peerState.connackTimer.unref();
+      }
+
       ws.send(connectBuf, (err) => {
         if (err && !this.shuttingDown) {
           console.error(`${logPrefix} Failed to send CONNECT packet: ${err.message}`);
+          ws.terminate();
         }
       });
     });
@@ -372,8 +395,11 @@ export class PeerBridgeManager {
       if (code === 401 || code === 403 || code === 429 || code === 508) {
         authRefused = true;
         console.error(`${logPrefix} ✗ Upstream HTTP ${code} on WebSocket upgrade — pausing retries for ${AUTH_REFUSED_BACKOFF_MS / 60000}m`);
+      } else {
+        console.warn(`${logPrefix} ✗ Upstream HTTP ${code} on WebSocket upgrade — scheduling reconnect`);
       }
       res.resume();
+      ws.terminate();
     });
 
     ws.on('error', (err: Error) => {
@@ -498,13 +524,8 @@ export class PeerBridgeManager {
     });
   }
 
-  public forwardLocalPacket(packet: { topic: string; payload: Buffer | string; qos?: number; retain?: boolean; fromPeer?: boolean }): void {
+  public forwardLocalPacket(packet: { topic: string; payload: Buffer | string; qos?: number; retain?: boolean }): void {
     if (this.shuttingDown || this.peers.size === 0) {
-      return;
-    }
-
-    // Defense-in-depth: NEVER forward a packet that arrived from another peer
-    if ((packet as any).fromPeer === true) {
       return;
     }
 
@@ -533,7 +554,7 @@ export class PeerBridgeManager {
         // Connected, no backlog, and socket buffer healthy: send immediately
         this.sendPublishFrame(peerState, packet.topic, payloadBuffer);
       } else {
-        // Disconnected or draining backlog: buffer in bounded queue
+        // Disconnected, draining backlog, or momentary socket backpressure: buffer in bounded queue
         this.pruneExpiredQueue(peerState, now);
 
         // Coalesce /status updates per observer topic in-place so latest status is always kept
@@ -550,6 +571,9 @@ export class PeerBridgeManager {
               enqueuedAt: now,
               byteSize: itemBytes,
             };
+            if (peerState.connected && !peerState.draining) {
+              this.drainQueue(peerState);
+            }
             continue;
           }
         }
@@ -579,6 +603,10 @@ export class PeerBridgeManager {
 
         if (this.debugLog) {
           console.log(`${logPrefix} Queued packet -> ${packet.topic} (queue: ${peerState.queue.length}/${this.maxQueueSize})`);
+        }
+
+        if (peerState.connected && !peerState.draining) {
+          this.drainQueue(peerState);
         }
       }
     }

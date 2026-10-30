@@ -162,7 +162,7 @@ while (true) {
     });
     console.log(`[CONFIG] Loaded subscriber user: ${username} (role: ${roleNames[role]}, maxConnections: ${maxConn})`);
   } else {
-    console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex}: ${subscriberEnvVar}`);
+    console.warn(`[CONFIG] Invalid format for SUBSCRIBER_${subscriberIndex} (value redacted)`);
   }
   
   subscriberIndex++;
@@ -223,31 +223,67 @@ function dropPacketSilently(packet: any, callback: (err?: Error | null) => void)
   callback(null);
 }
 
+// Inbound peer rate limiting (token bucket per authenticated peer identity)
+const peerRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+function checkPeerRateLimit(peerKey: string): boolean {
+  const rate = peerConfig.peerRateLimitPerSec || 500;
+  const capacity = Math.max(rate * 2, 100);
+  const now = Date.now();
+  let bucket = peerRateBuckets.get(peerKey);
+  if (!bucket) {
+    if (peerRateBuckets.size >= 1000) {
+      const oldest = peerRateBuckets.keys().next().value;
+      if (oldest) peerRateBuckets.delete(oldest);
+    }
+    bucket = { tokens: capacity, lastRefill: now };
+    peerRateBuckets.set(peerKey, bucket);
+  } else {
+    const elapsedSec = Math.max(0, (now - bucket.lastRefill) / 1000);
+    bucket.tokens = Math.min(capacity, bucket.tokens + elapsedSec * rate);
+    bucket.lastRefill = now;
+  }
+  if (bucket.tokens < 1) {
+    return false;
+  }
+  bucket.tokens -= 1;
+  return true;
+}
+
 // Bounded cross-path deduplication cache for non-status telemetry (packets, neighbors, raw)
 const DEDUP_TTL_MS = 120_000;
 const DEDUP_MAX_ENTRIES = 50_000;
-const seenPacketHashes = new Map<string, { timestamp: number; sourceId: string }>();
+const seenPacketHashes = new Map<
+  string,
+  { timestamp: number; sourceId: string; forwardedByLocal: boolean }
+>();
 
-function isCrossPathDuplicate(
+function checkCrossPathDuplicate(
   normalizedTopic: string,
   subtopic: string,
   payload: Buffer,
   sourceId: string,
   isPeerClient: boolean
-): boolean {
+): { duplicate: boolean; shouldForwardToPeers: boolean } {
   if (subtopic !== 'packets' && subtopic !== 'neighbors' && subtopic !== 'raw') {
-    return false;
+    return { duplicate: false, shouldForwardToPeers: false };
   }
   const now = Date.now();
   const hash = createHash('sha256').update(normalizedTopic).update(':').update(payload).digest('hex');
   const existing = seenPacketHashes.get(hash);
   if (existing !== undefined && now - existing.timestamp < DEDUP_TTL_MS) {
     // If the duplicate arrived from a DIFFERENT client connection (e.g., dual-connected observer
-    // or multi-peer path) or over a peer link, drop it as a cross-path duplicate.
-    // Same-connection local publisher duplicates are passed through to AbuseDetector so
-    // per-observer duplicate_flood detection and muting continue to work as designed.
+    // or multi-peer path) or over a peer link, drop it for local subscribers.
+    // However, if a peer copy arrived first (!existing.forwardedByLocal) and the direct local
+    // observer copy arrives second (!isPeerClient), still forward the local observer copy to
+    // outbound peers so backup paths (e.g., C -> B when A -> B is down) remain intact.
     if (isPeerClient || existing.sourceId !== sourceId) {
-      return true;
+      let shouldForwardToPeers = false;
+      if (!isPeerClient && !existing.forwardedByLocal) {
+        existing.forwardedByLocal = true;
+        shouldForwardToPeers = true;
+      }
+      return { duplicate: true, shouldForwardToPeers };
     }
   }
 
@@ -264,8 +300,12 @@ function isCrossPathDuplicate(
     }
   }
 
-  seenPacketHashes.set(hash, { timestamp: now, sourceId });
-  return false;
+  seenPacketHashes.set(hash, {
+    timestamp: now,
+    sourceId,
+    forwardedByLocal: !isPeerClient,
+  });
+  return { duplicate: false, shouldForwardToPeers: false };
 }
 
 // Throttle retained /internal publishes to once per 30s per observer (or immediately on status change)
@@ -619,7 +659,16 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
   // Inbound Peer broker clients (ClientType.PEER)
   if (clientType === ClientType.PEER) {
-    (packet as any).fromPeer = true;
+    const peerKey = (client as any).publicKey || (client as any).username || client.id;
+    if (!checkPeerRateLimit(peerKey)) {
+      if (isDebug) {
+        console.log(
+          `${logPrefix} [RATE_LIMIT] Dropped peer packet exceeding PEER_RATE_LIMIT_PER_SEC (${peerConfig.peerRateLimitPerSec}/s)`
+        );
+      }
+      dropPacketSilently(packet, callback);
+      return;
+    }
 
     const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
     if (!validation.valid) {
@@ -635,7 +684,8 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     const payloadBuf = ensureBuffer(packet.payload);
 
     // Deduplicate cross-path packets (e.g., dual-connected observers or multi-hop topologies)
-    if (isCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, true)) {
+    const dedup = checkCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, true);
+    if (dedup.duplicate) {
       if (isDebug) {
         console.log(`${logPrefix} [DEDUP] Dropped duplicate peer packet -> ${packet.topic}`);
       }
@@ -656,8 +706,15 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       }
 
       if (trustState) {
-        abuseDetector.checkIataChange(trustState, locationCode);
-        const allowed = abuseDetector.recordPacket({ publicKey: originKey } as any, packet);
+        if (!trustState.currentIata) {
+          trustState.currentIata = locationCode;
+        }
+        const allowed = abuseDetector.recordPacket(
+          { publicKey: originKey } as any,
+          packet,
+          validation.parsedMessage,
+          { fromPeer: true }
+        );
         if (!allowed) {
           if (isDebug) {
             console.log(`${logPrefix} [ABUSE] Silenced peer-forwarded packet from muted observer ${originKey.substring(0, 8)}`);
@@ -758,19 +815,19 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
     const subtopic = topicParts.slice(3).join('/');
 
-    // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is blocked
+    // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is dropped silently
     if (subtopic === 'internal' || subtopic.startsWith('internal/') || subtopic.includes('/internal')) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (clients cannot publish to /internal directly)`);
       sysMetrics.recordUnauthorizedPublish();
-      callback(new Error('Clients are not permitted to publish directly to /internal subtopics'));
+      dropPacketSilently(packet, callback);
       return;
     }
 
-    // Enforce subtopic allowlist
+    // Enforce subtopic allowlist without disconnecting the client
     if (!ALLOWED_PUBLISHER_SUBTOPICS.has(subtopic)) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (disallowed subtopic: ${subtopic})`);
+      console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (disallowed subtopic: ${subtopic})`);
       sysMetrics.recordUnauthorizedPublish();
-      callback(new Error(`Publishers are not permitted to publish to subtopic: ${subtopic}`));
+      dropPacketSilently(packet, callback);
       return;
     }
 
@@ -832,24 +889,13 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         return;
       }
 
-      // Check cross-path deduplication (drops if already received from a peer or second connection)
-      const payloadBuf = ensureBuffer(packet.payload);
-      if (isCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, false)) {
-        if (isDebug) {
-          console.log(`${logPrefix} [DEDUP] Dropped cross-path duplicate packet -> ${packet.topic}`);
-        }
-        sysMetrics.recordDuplicateFiltered();
-        dropPacketSilently(packet, callback);
-        return;
-      }
-      
       // Track with abuse detector and enforce 4-hour temporary mute timeout if enabled
       const trustState = abuseDetector.getClientStats(clientPublicKey);
       let allowed = true;
       if (trustState) {
         const prevStatus = trustState.status;
         abuseDetector.checkIataChange(trustState, normalizedLocation);
-        allowed = abuseDetector.recordPacket(client, packet);
+        allowed = abuseDetector.recordPacket(client, packet, message);
 
         if (prevStatus !== trustState.status) {
           maybePublishInternalState(
@@ -867,6 +913,27 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         if (isDebug) {
           console.log(`${logPrefix} [ABUSE] Silenced packet from muted publisher -> ${packet.topic}`);
         }
+        dropPacketSilently(packet, callback);
+        return;
+      }
+
+      // Check cross-path deduplication (drops for local subscribers if already received from a peer or second connection,
+      // while preserving outbound peer forwarding if the prior copy came from a peer)
+      const payloadBuf = ensureBuffer(packet.payload);
+      const dedup = checkCrossPathDuplicate(packet.topic, subtopic, payloadBuf, client.id, false);
+      if (dedup.duplicate) {
+        if (dedup.shouldForwardToPeers && peerBridgeManager) {
+          peerBridgeManager.forwardLocalPacket({
+            topic: packet.topic,
+            payload: payloadBuf,
+            qos: packet.qos,
+            retain: packet.retain,
+          });
+        }
+        if (isDebug) {
+          console.log(`${logPrefix} [DEDUP] Dropped cross-path duplicate packet -> ${packet.topic}`);
+        }
+        sysMetrics.recordDuplicateFiltered();
         dropPacketSilently(packet, callback);
         return;
       }
@@ -1155,12 +1222,11 @@ aedes.on('publish', (packet, client) => {
 
   // Strict Origin-Only Peer Forwarding:
   // ONLY forward packets published directly by local observers (ClientType.PUBLISHER)
-  // NEVER forward packets received from another peer broker (ClientType.PEER / packet.fromPeer)
+  // NEVER forward packets received from another peer broker (ClientType.PEER)
   if (
     peerBridgeManager &&
     client &&
-    (client as any).clientType === ClientType.PUBLISHER &&
-    !(packet as any).fromPeer
+    (client as any).clientType === ClientType.PUBLISHER
   ) {
     peerBridgeManager.forwardLocalPacket(packet);
   }

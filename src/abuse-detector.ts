@@ -745,7 +745,12 @@ export class AbuseDetector {
   // Packet Processing
   // ============================================================================
 
-  public recordPacket(clientOrKey: any, packet: any, parsedMessage?: any): boolean {
+  public recordPacket(
+    clientOrKey: any,
+    packet: any,
+    parsedMessage?: any,
+    options?: { fromPeer?: boolean }
+  ): boolean {
     const rawKey = typeof clientOrKey === 'string' ? clientOrKey : clientOrKey?.publicKey;
     if (!rawKey) {
       return false;
@@ -774,17 +779,24 @@ export class AbuseDetector {
     state.totalPacketsReceived++;
     state.lastPacketAt = now;
 
-    // Reset peak if no packets in last hour (O(1) decay check using prevLastPacketAt)
-    if (prevLastPacketAt > 0 && now - prevLastPacketAt > RATE_WINDOW_MS) {
-      state.peakRateObserved = 0;
-    }
-
     // Update average packet size
     const payloadSize = packet.payload.length;
     if (state.avgPacketSize === 0) {
       state.avgPacketSize = payloadSize;
     } else {
       state.avgPacketSize = state.avgPacketSize * 0.9 + payloadSize * 0.1;
+    }
+
+    // Peer-forwarded packets were already rate-limited and duplicate-checked at the origin broker,
+    // and may arrive in bursts when a peer drains its reconnect queue. Do not charge the local
+    // observer's rate-limit token bucket or duplicate flood detector for peer-forwarded traffic.
+    if (options?.fromPeer) {
+      return true;
+    }
+
+    // Reset peak if no packets in last hour (O(1) decay check using prevLastPacketAt)
+    if (prevLastPacketAt > 0 && now - prevLastPacketAt > RATE_WINDOW_MS) {
+      state.peakRateObserved = 0;
     }
 
     // O(1) 10-second rolling rate calculation using 1-second ring buffer buckets

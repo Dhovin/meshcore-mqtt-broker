@@ -252,9 +252,11 @@ export function loadPeerConfig(): PeerConfig {
     const peer = parsePeerString(peerEnvVar, `peer_${peerIndex}`);
     if (peer) {
       peers.push(peer);
-      console.log(`[CONFIG] Loaded outbound peer: ${peer.id} -> ${peer.url} (audience: ${peer.targetAudience})`);
+      console.log(`[CONFIG] Loaded outbound peer: ${peer.id} -> ${peer.url} (audience: ${peer.targetAudience || 'username-auth'})`);
     } else {
-      console.warn(`[CONFIG] Invalid format for PEER_${peerIndex}: "${peerEnvVar}". Expected URL:targetAudience or URL:username:password`);
+      console.warn(
+        `[CONFIG] Invalid format for PEER_${peerIndex} (value redacted). Expected URL|targetAudience or URL|username|password`
+      );
     }
 
     peerIndex++;

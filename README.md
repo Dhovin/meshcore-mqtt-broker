@@ -191,10 +191,15 @@ Examples:
 2. **`{PUBLIC_KEY}`**:
    - Must be 64 hexadecimal characters matching the publisher's authenticated public key (normalized to uppercase).
    - Mismatched or malformed public keys in the topic are rejected and **immediately disconnect the client**.
-3. **Standard Subtopic Payloads (`packets`, `status`, etc.)**:
+3. **Allowed Publisher Subtopics & Payload Validation (`packets`, `status`, `neighbors`, `raw`, `serial/responses`)**:
+   - Publishers are permitted to publish to subtopics in the allowlist: `packets`, `status`, `neighbors`, `raw`, and `serial/responses`.
+   - Publishes to unrecognized subtopics or direct client publishes to `/internal` are **silently dropped** without disconnecting the observer socket (avoiding client reconnect storms).
    - Payloads must not exceed `MQTT_MAX_PACKET_BYTES` (default: `65536` bytes / 64 KB).
-   - Must be valid UTF-8 JSON containing an `origin_id` field matching the authenticated `PUBLIC_KEY` (case-insensitive).
-4. **Special Subtopic Behaviors**:
+   - Standard subtopics (`packets`, `status`, `neighbors`, `raw`) must be valid UTF-8 JSON containing an `origin_id` field matching the authenticated `PUBLIC_KEY` (case-insensitive).
+4. **Peer Broker Trust Model & Rate Limiting**:
+   - Authorized peer brokers (`AUTHORIZED_PEERS` Ed25519 public keys or Role 4 `PEER` accounts) are **trusted broker-to-broker links** that forward validated observer telemetry (`packets`, `status`, `neighbors`, `raw`) on behalf of their local observers (`origin_id` must match the `{PUBLIC_KEY}` in the topic). Only peer keys and credentials under trusted administrative control should be added to `AUTHORIZED_PEERS` or Role 4 accounts.
+   - Inbound peer traffic is rate-limited per peer identity via `PEER_RATE_LIMIT_PER_SEC` (default: `500` msg/s, burst `1000`), and does not charge the individual observer's local rate-limit bucket or duplicate-flood mute counter (preventing reconnect queue drains from muting active observers).
+5. **Special Subtopic Behaviors**:
    - **`/status` (`meshcore/{IATA}/{PUBLIC_KEY}/status`)**:
      - **Retain Flag Stripping**: Any `retain: true` flag on `/status` messages (including Last Will and Testament / LWT offline messages) is automatically stripped so stale status payloads are never retained.
      - **Stale Status / LWT Race Protection**: The broker tracks the latest `timestamp` per `origin_id` on `/status` messages and drops out-of-order status messages with an older timestamp than already seen.
@@ -344,6 +349,7 @@ cp .env.example .env
 | `PEER_QUEUE_MAX_SIZE` | No | `5000` | Maximum queued packets per outbound peer during disconnects |
 | `PEER_QUEUE_MAX_BYTES` | No | `8388608` | Maximum queued bytes per outbound peer (`8 MiB`) |
 | `PEER_QUEUE_TTL_MS` | No | `600000` | Maximum packet age in outbound peer queue (`10 min`) |
+| `PEER_RATE_LIMIT_PER_SEC` | No | `500` | Max inbound messages/sec per authenticated peer broker (`2x` burst capacity) |
 
 ### Abuse Detection & Persistence Variables
 

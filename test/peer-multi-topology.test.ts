@@ -357,6 +357,77 @@ describe('Multi-Peer Topology: Broker A -> B & C, and Broker C -> B (Origin-Only
         1,
         'Dual-connected observer publishing identical packet via Broker A and Broker B must be deduplicated on Broker B'
       );
+
+      // 4. Backup Path Preservation Test (Peer A -> C arrives at C BEFORE direct Observer -> C, while A -> B is down):
+      // Connect a simulated peer client directly to Broker C using peerKeyA (authorized peer on C),
+      // and publish a packet ONLY to Broker C (simulating A -> B link being down while A -> C is up).
+      // Then connect Observer 1 directly to Broker C and publish the same packet.
+      // Broker C must:
+      //   - Deliver the packet only ONCE to subC (deduplicating the local subscriber copy)
+      //   - Still forward Observer 1's direct local publish on C -> B so Broker B receives the packet!
+      const peerAOnC = await connectMqttWsClient(
+        `ws://127.0.0.1:${portC}`,
+        'sim_peer_a_on_c',
+        `v1_${peerKeyA.publicKeyHex}`,
+        await createPeerJwt(peerKeyA, 'broker-c.local', 3600)
+      );
+      clients.push(peerAOnC);
+
+      const obs1JwtC = await createPeerJwt(obs1Key, 'broker-c.local', 3600);
+      const obs1ClientC = await connectMqttWsClient(
+        `ws://127.0.0.1:${portC}`,
+        'obs1_on_c',
+        `v1_${obs1Key.publicKeyHex}`,
+        obs1JwtC
+      );
+      clients.push(obs1ClientC);
+
+      const backupPayload = JSON.stringify({
+        origin_id: obs1Key.publicKeyHex,
+        packet_id: 'backup-path-c-to-b-777',
+        SNR: 7.5,
+      });
+
+      // Step 4a: Peer copy arrives at Broker C first (Broker C does not forward peer copies to B)
+      await peerAOnC.publish(topicObs1, backupPayload);
+      await new Promise((r) => setTimeout(r, 150));
+      assert.strictEqual(
+        subB.received.filter((m) => m.payload.includes('backup-path-c-to-b-777')).length,
+        0,
+        'Peer-forwarded copy on C must not be re-forwarded to B'
+      );
+
+      // Step 4b: Direct local observer copy arrives at Broker C second -> C must forward it to B!
+      await obs1ClientC.publish(topicObs1, backupPayload);
+      await new Promise((r) => setTimeout(r, 300));
+
+      assert.strictEqual(
+        subC.received.filter((m) => m.payload.includes('backup-path-c-to-b-777')).length,
+        1,
+        'Subscriber on C must still receive the packet only once'
+      );
+      assert.strictEqual(
+        subB.received.filter((m) => m.payload.includes('backup-path-c-to-b-777')).length,
+        1,
+        'Broker B must receive the packet via C -> B backup path when local observer publishes to C after peer copy'
+      );
+
+      // 5. Disallowed subtopic silent drop test on obs1ClientC (must NOT disconnect obs1ClientC!)
+      await obs1ClientC.publish(
+        `meshcore/SEA/${obs1Key.publicKeyHex}/debug`,
+        JSON.stringify({ origin_id: obs1Key.publicKeyHex, msg: 'unsupported-subtopic' })
+      );
+      await new Promise((r) => setTimeout(r, 150));
+      assert.strictEqual(
+        obs1ClientC.ws.readyState,
+        WebSocket.OPEN,
+        'Publishing to an unsupported subtopic must silently drop the packet without disconnecting the observer'
+      );
+      assert.strictEqual(
+        subC.received.filter((m) => m.topic.endsWith('/debug')).length,
+        0,
+        'Unsupported subtopic must not be delivered to subscribers'
+      );
     } finally {
       for (const c of clients) c.close();
       for (const p of brokers) {
