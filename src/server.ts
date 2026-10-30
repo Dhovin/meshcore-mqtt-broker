@@ -848,7 +848,8 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       if (!ALLOWED_REGIONS?.has(locationCode.toUpperCase()) && !isValidIATACode(locationCode)) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
         console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code: "${locationCode}"`);
-        if (ALLOWED_REGIONS && (client as any).publicKey) {
+        // A will being published means the client is already closing; deny it without blocking the key
+        if (ALLOWED_REGIONS && (client as any).publicKey && packet !== (client as any).will) {
           observerRegionBlocklist.block((client as any).publicKey.toUpperCase(), locationCode);
           suppressWill(client);
         }
@@ -888,6 +889,15 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     // Enforce ALLOWED_REGIONS for Observer connections:
     // Immediately drop the packet, block the Observer's public key for 1 minute, and terminate the session.
     if (!isRegionAllowed(normalizedLocation, ALLOWED_REGIONS)) {
+      // A will being published means the client is already closing; deny it without blocking the key
+      if (packet === (client as any).will) {
+        console.log(
+          `${logPrefix} [AUTHZ] ✗ Will denied -> ${packet.topic} (unapproved IATA region: "${normalizedLocation}")`
+        );
+        sysMetrics.recordUnauthorizedPublish();
+        callback(new Error(`IATA region "${normalizedLocation}" is not permitted on this broker`));
+        return;
+      }
       console.log(
         `${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unapproved IATA region: "${normalizedLocation}")`
       );

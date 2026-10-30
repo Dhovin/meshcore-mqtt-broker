@@ -518,4 +518,63 @@ describe('End-to-End Broker Enforcement: ALLOWED_REGIONS (Peers vs. Observers)',
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it('refuses to start when ALLOWED_REGIONS has no usable codes', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-region-filter-'));
+    try {
+      const port = await getFreePort();
+      await assert.rejects(
+        () => spawnBroker('region-bad-config', port, 'broker-region.meshcore.local', tempDir, { ALLOWED_REGIONS: 'DFW;ORD' }),
+        /exited prematurely with code 1/
+      );
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops an unapproved will on disconnect without blocking the observer', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-region-filter-'));
+    const port = await getFreePort();
+    const audience = 'broker-region.meshcore.local';
+    const observerKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const clients: MqttWsClient[] = [];
+    let brokerProc: ChildProcess | undefined;
+
+    try {
+      const broker = await spawnBroker('region-will', port, audience, tempDir, { ALLOWED_REGIONS: 'DFW' });
+      brokerProc = broker.proc;
+      const wsUrl = `ws://127.0.0.1:${port}`;
+
+      const sub = await connectMqttWsClient(wsUrl, 'sub_admin', 'admin', 'adminpass123');
+      clients.push(sub);
+      await sub.subscribe('meshcore/#');
+
+      const jwt = await createPeerJwt(observerKey, audience, 3600);
+      const observer = await connectMqttWsClient(wsUrl, 'obs_will', `v1_${observerKey.publicKeyHex}`, jwt, {
+        topic: `meshcore/SEA/${observerKey.publicKeyHex}/status`,
+        payload: Buffer.from(JSON.stringify({ origin_id: observerKey.publicKeyHex, status: 'offline' }), 'utf-8'),
+        qos: 0,
+        retain: false,
+      });
+
+      const closed = observer.waitForClose(3000);
+      observer.ws.terminate();
+      await closed;
+      await new Promise((r) => setTimeout(r, 150));
+
+      assert.strictEqual(
+        sub.received.some((m) => m.topic.includes(observerKey.publicKeyHex)),
+        false,
+        'Unapproved will must not be delivered'
+      );
+
+      const reconnected = await connectMqttWsClient(wsUrl, 'obs_will', `v1_${observerKey.publicKeyHex}`, jwt);
+      clients.push(reconnected);
+    } finally {
+      for (const c of clients) c.close();
+      brokerProc?.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 150));
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });
