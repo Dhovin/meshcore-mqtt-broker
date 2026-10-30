@@ -19,12 +19,12 @@ import { PeerBridgeManager, validatePeerPacket } from './peer-bridge.js';
 import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto.js';
 
 // Read broker version from package.json
-let brokerVersion = '1.0.3';
+let brokerVersion = '1.0.4';
 try {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
   if (pkg.version) brokerVersion = pkg.version;
 } catch {
-  // Fallback to 1.0.3 if package.json cannot be read
+  // Fallback to 1.0.4 if package.json cannot be read
 }
 
 // Load and validate configuration

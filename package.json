@@ -1,6 +1,6 @@
 {
   "name": "meshcore-mqtt-broker",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "MeshCore MQTT broker with public key authentication",
   "type": "module",
   "main": "dist/server.js",
