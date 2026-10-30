@@ -41,22 +41,17 @@ const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
 
-// Initialize peer identity and outbound peer bridge manager if configured
+// Always initialize the broker's Ed25519 peer identity on startup (persisted in /data/peer-identity.json)
+// so its public key is immediately visible in the startup banner and $SYS telemetry.
 let peerIdentity: PeerKeyPair | undefined;
 let peerBridgeManager: PeerBridgeManager | undefined;
 
-if (
-  peerConfig.peers.length > 0 ||
-  peerConfig.peerPrivateKey ||
-  (peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.size > 0)
-) {
-  try {
-    const dataDir = dirname(abuseConfig.persistencePath);
-    peerIdentity = await loadOrCreatePeerIdentity(peerConfig.peerPrivateKey, dataDir);
-    console.log(`[PEER] Broker peer identity initialized - Public Key: ${peerIdentity.publicKeyHex}`);
-  } catch (err: any) {
-    console.error(`[PEER] Failed to initialize peer identity: ${err?.message || err}`);
-  }
+try {
+  const dataDir = dirname(abuseConfig.persistencePath);
+  peerIdentity = await loadOrCreatePeerIdentity(peerConfig.peerPrivateKey, dataDir);
+  console.log(`[PEER] Broker peer identity initialized - Public Key: ${peerIdentity.publicKeyHex}`);
+} catch (err: any) {
+  console.error(`[PEER] Failed to initialize peer identity: ${err?.message || err}`);
 }
 
 if (peerConfig.peers.length > 0) {
@@ -190,6 +185,7 @@ const sysMetrics = new SysMetricsCollector({
   abuseDetector,
   subscriberAccounts: subscriberAccountsMeta,
   brokerVersion,
+  brokerPublicKey: peerIdentity?.publicKeyHex,
   wsPort: WS_PORT,
   tcpEnabled: ENABLE_TCP,
   tcpPort: TCP_PORT,
@@ -1544,6 +1540,9 @@ httpServer.listen(WS_PORT, HOST, () => {
   console.log(`║         ${bannerTitle}║`);
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`Runtime Environment:        Node.js ${process.version} (${process.platform}/${process.arch}, aedes v${aedesVer})`);
+  if (peerIdentity) {
+    console.log(`Broker Peer Public Key:     ${peerIdentity.publicKeyHex}`);
+  }
   console.log(`WebSocket MQTT listening on: ws://${HOST}:${WS_PORT}`);
   if (ENABLE_TCP) {
     console.log(`Standard TCP MQTT listening on: mqtt://${HOST}:${TCP_PORT}`);
@@ -1570,15 +1569,13 @@ httpServer.listen(WS_PORT, HOST, () => {
   if (EXPECTED_AUDIENCE) {
     console.log(`       - Token audience must be: ${EXPECTED_AUDIENCE}`);
   }
-  if (peerConfig.peers.length > 0 || (peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.size > 0)) {
-    console.log('');
-    console.log('  3. Peer Broker Interconnect (Origin-Only Forwarding):');
-    console.log(`     Outbound Peers: ${peerConfig.peers.length}`);
-    console.log(`     Authorized Inbound Peer Keys: ${peerConfig.authorizedPeerKeys?.size || 0}`);
-    if (peerIdentity) {
-      console.log(`     Local Peer Public Key: ${peerIdentity.publicKeyHex}`);
-    }
+  console.log('');
+  console.log('  3. Peer Broker Interconnect (Origin-Only Forwarding):');
+  if (peerIdentity) {
+    console.log(`     Local Peer Public Key: ${peerIdentity.publicKeyHex}`);
   }
+  console.log(`     Outbound Peers: ${peerConfig.peers.length}`);
+  console.log(`     Authorized Inbound Peer Keys: ${peerConfig.authorizedPeerKeys?.size || 0}`);
   console.log('');
   console.log('Ready to accept connections...');
 });

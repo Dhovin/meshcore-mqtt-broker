@@ -249,8 +249,9 @@ This hybrid layout is optimized for **MQTT Explorer**:
 
 | Topic | Type | Description |
 | :--- | :---: | :--- |
-| `$SYS/broker/summary` | JSON | All-in-one snapshot of broker health, clients, active IATA regions, traffic rates, and security |
+| `$SYS/broker/summary` | JSON | All-in-one snapshot of broker health, public key, clients, active IATA regions, traffic rates, and security |
 | `$SYS/broker/version` | String | Broker version, Aedes version, and Node.js runtime version |
+| `$SYS/broker/public_key` | String | This broker instance's 64-character Ed25519 peer public key |
 | `$SYS/broker/started_at` | String | ISO-8601 timestamp when the broker started |
 | `$SYS/broker/uptime` | Number | Broker uptime in seconds |
 | `$SYS/broker/uptime/formatted` | String | Human-readable uptime (`Xd Xh Xm Xs`) |
@@ -268,7 +269,8 @@ This hybrid layout is optimized for **MQTT Explorer**:
 | `$SYS/broker/clients/publishers` | Number | Currently connected MeshCore publishers |
 | `$SYS/broker/clients/peers` | Number | Currently connected inbound peer brokers |
 | `$SYS/broker/clients/subscribers` | Number | Currently connected subscribers |
-| `$SYS/broker/peers` | JSON | Inbound connected peer count and outbound peer bridge status (`connected`, `queued`, `queuedBytes`, `forwarded`, `dropped`, `url`) |
+| `$SYS/broker/peers` | JSON | Broker peer `publicKey`, inbound connected peer count, and outbound peer bridge status (`connected`, `queued`, `queuedBytes`, `forwarded`, `dropped`, `url`) |
+| `$SYS/broker/peers/public_key` | String | This broker instance's 64-character Ed25519 peer public key |
 | `$SYS/broker/peers/inbound_connected` | Number | Currently connected inbound peer brokers |
 | `$SYS/broker/peers/outbound_count` | Number | Configured outbound peer bridges |
 | `$SYS/broker/clients/websocket` | Number | Active WebSocket connections |

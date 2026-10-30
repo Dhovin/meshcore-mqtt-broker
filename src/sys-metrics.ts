@@ -20,6 +20,7 @@ export interface SysMetricsOptions {
   abuseDetector: AbuseDetector;
   subscriberAccounts: Map<string, SubscriberAccountMeta>;
   brokerVersion: string;
+  brokerPublicKey?: string;
   wsPort: number;
   tcpEnabled: boolean;
   tcpPort: number;
@@ -40,6 +41,7 @@ export class SysMetricsCollector {
   private readonly abuseDetector: AbuseDetector;
   private readonly subscriberAccounts: Map<string, SubscriberAccountMeta>;
   private readonly versionString: string;
+  private readonly brokerPublicKey?: string;
   private readonly wsPort: number;
   private readonly tcpEnabled: boolean;
   private readonly tcpPort: number;
@@ -93,6 +95,7 @@ export class SysMetricsCollector {
     this.rateLimiter = options.rateLimiter;
     this.abuseDetector = options.abuseDetector;
     this.subscriberAccounts = options.subscriberAccounts;
+    this.brokerPublicKey = options.brokerPublicKey;
     this.wsPort = options.wsPort;
     this.tcpEnabled = options.tcpEnabled;
     this.tcpPort = options.tcpPort;
@@ -443,6 +446,7 @@ export class SysMetricsCollector {
     const systemJson = {
       timestamp: nowMs,
       version: this.versionString,
+      publicKey: this.brokerPublicKey ?? null,
       startedAt: this.startedAtIso,
       uptimeSeconds,
       uptimeFormatted,
@@ -522,6 +526,7 @@ export class SysMetricsCollector {
 
     const peersJson = {
       timestamp: nowMs,
+      publicKey: this.brokerPublicKey ?? null,
       inboundConnectedPeers: connectedPeers,
       inboundRateLimited: this.peerRateLimited,
       outboundPeersCount: Object.keys(outboundPeerStats).length,
@@ -538,6 +543,7 @@ export class SysMetricsCollector {
     const summaryJson = {
       timestamp: nowMs,
       version: this.versionString,
+      publicKey: this.brokerPublicKey ?? null,
       uptimeSeconds,
       uptimeFormatted,
       clients: {
@@ -585,6 +591,9 @@ export class SysMetricsCollector {
     // Publish top-level & category JSON topics
     this.publishRetained('$SYS/broker/summary', JSON.stringify(summaryJson));
     this.publishRetained('$SYS/broker/version', this.versionString);
+    if (this.brokerPublicKey) {
+      this.publishRetained('$SYS/broker/public_key', this.brokerPublicKey);
+    }
     this.publishRetained('$SYS/broker/started_at', this.startedAtIso);
     this.publishRetained('$SYS/broker/uptime', String(uptimeSeconds));
     this.publishRetained('$SYS/broker/uptime/formatted', uptimeFormatted);
@@ -614,6 +623,9 @@ export class SysMetricsCollector {
 
     // Peers topics
     this.publishRetained('$SYS/broker/peers', JSON.stringify(peersJson));
+    if (this.brokerPublicKey) {
+      this.publishRetained('$SYS/broker/peers/public_key', this.brokerPublicKey);
+    }
     this.publishRetained('$SYS/broker/peers/inbound_connected', String(connectedPeers));
     this.publishRetained('$SYS/broker/peers/outbound_count', String(Object.keys(outboundPeerStats).length));
 
