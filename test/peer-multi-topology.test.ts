@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { createServer } from 'node:net';
+import { createServer, connect as netConnect } from 'node:net';
 import { spawn, ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -529,6 +529,163 @@ describe('Multi-Peer Topology: Broker A -> B & C, and Broker C -> B (Origin-Only
       );
     } finally {
       for (const c of clients) c.close();
+      for (const p of brokers) {
+        p.kill();
+        await new Promise((resolve) => p.once('exit', resolve));
+      }
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drains a >1,000-packet outage backlog end-to-end without peer rate-limit drops or muting the observer on the receiver', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-e2e-backlog-'));
+    const portA = await getFreePort();
+    const portB = await getFreePort();
+    const proxyPort = await getFreePort();
+
+    const peerKeyA = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const peerKeyB = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const obsKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+
+    const brokers: ChildProcess[] = [];
+    const clients: MqttWsClient[] = [];
+
+    // TCP relay simulating a network outage between Broker A and Broker B
+    let outageActive = true;
+    const activeSockets = new Set< any >();
+    const proxyServer = createServer((clientSocket) => {
+      activeSockets.add(clientSocket);
+      clientSocket.on('close', () => activeSockets.delete(clientSocket));
+      if (outageActive) {
+        clientSocket.destroy();
+        return;
+      }
+      const upstream = netConnect(portB, '127.0.0.1');
+      activeSockets.add(upstream);
+      upstream.on('close', () => activeSockets.delete(upstream));
+      clientSocket.pipe(upstream);
+      upstream.pipe(clientSocket);
+      clientSocket.on('error', () => upstream.destroy());
+      upstream.on('error', () => clientSocket.destroy());
+    });
+    await new Promise<void>((resolve) => proxyServer.listen(proxyPort, '127.0.0.1', resolve));
+
+    try {
+      // Receiver Broker B: strict observer token bucket (capacity 20, refill 3/s) + enforcement enabled,
+      // and default PEER_RATE_LIMIT_PER_SEC=500 with PEER_QUEUE_MAX_SIZE=5000 burst capacity
+      const brokerB = await spawnBroker('BacklogB', portB, 'broker-b.local', tempDir, {
+        PEER_PRIVATE_KEY: peerKeyB.privateKeyHex,
+        AUTHORIZED_PEERS: peerKeyA.publicKeyHex,
+        ABUSE_ENFORCEMENT_ENABLED: 'true',
+        ABUSE_BUCKET_CAPACITY: '20',
+        ABUSE_BUCKET_REFILL_RATE: '3',
+        MQTT_SYS_INTERVAL_MS: '300',
+      });
+      brokers.push(brokerB.proc);
+
+      // Sender Broker A: high local bucket so test can enqueue 1,200 packets rapidly while link is down
+      const brokerA = await spawnBroker('BacklogA', portA, 'broker-a.local', tempDir, {
+        PEER_PRIVATE_KEY: peerKeyA.privateKeyHex,
+        PEER_1: `ws://127.0.0.1:${proxyPort}|broker-b.local`,
+        ABUSE_BUCKET_CAPACITY: '2500',
+        ABUSE_BUCKET_REFILL_RATE: '1000',
+      });
+      brokers.push(brokerA.proc);
+
+      // Subscribe on Broker B BEFORE the outage recovers so we capture every drained packet
+      const subB = await connectMqttWsClient(`ws://127.0.0.1:${portB}`, 'sub_b_backlog', 'admin', 'adminpass123');
+      clients.push(subB);
+      await subB.subscribe('meshcore/#');
+      await subB.subscribe('$SYS/broker/traffic/peer_rate_limited');
+      await subB.subscribe('$SYS/broker/regions/SFO');
+
+      // Connect Observer to Broker A and publish 1,200 unique packets while Broker A -> B link is down
+      const obsJwtA = await createPeerJwt(obsKey, 'broker-a.local', 3600);
+      const obsClientA = await connectMqttWsClient(
+        `ws://127.0.0.1:${portA}`,
+        'obs_backlog_a',
+        `v1_${obsKey.publicKeyHex}`,
+        obsJwtA
+      );
+      clients.push(obsClientA);
+
+      const totalBacklogPackets = 1200;
+      const topicSea = `meshcore/SEA/${obsKey.publicKeyHex}/packets`;
+      const topicSfo = `meshcore/SFO/${obsKey.publicKeyHex}/packets`;
+
+      for (let i = 0; i < totalBacklogPackets; i++) {
+        // Move observer region on the final packet to verify peer region reporting updates
+        const topic = i === totalBacklogPackets - 1 ? topicSfo : topicSea;
+        await obsClientA.publish(
+          topic,
+          JSON.stringify({
+            origin_id: obsKey.publicKeyHex,
+            seq: i,
+          })
+        );
+      }
+
+      // Give Broker A a moment to finish enqueueing all 1,200 packets into PEER_1 queue
+      await new Promise((r) => setTimeout(r, 200));
+      assert.strictEqual(subB.received.filter((m) => m.topic.startsWith('meshcore/')).length, 0);
+
+      // End the outage so Broker A reconnects and drains all 1,200 packets paced at 500/s
+      outageActive = false;
+
+      const drainDeadline = Date.now() + 8000;
+      while (Date.now() < drainDeadline) {
+        const count = subB.received.filter((m) => m.topic === topicSea || m.topic === topicSfo).length;
+        if (count >= totalBacklogPackets) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+
+      const receivedBacklog = subB.received.filter((m) => m.topic === topicSea || m.topic === topicSfo);
+      assert.strictEqual(
+        receivedBacklog.length,
+        totalBacklogPackets,
+        `Expected all ${totalBacklogPackets} backlog packets to arrive on Broker B, got ${receivedBacklog.length}`
+      );
+
+      // Verify $SYS/broker/traffic/peer_rate_limited is 0
+      await new Promise((r) => setTimeout(r, 400));
+      const rateLimitedMsgs = subB.received.filter((m) => m.topic === '$SYS/broker/traffic/peer_rate_limited');
+      if (rateLimitedMsgs.length > 0) {
+        assert.strictEqual(rateLimitedMsgs[rateLimitedMsgs.length - 1].payload, '0');
+      }
+
+      // Verify peer-only observer region updated to SFO in $SYS/broker/regions/SFO
+      const sfoRegionMsgs = subB.received.filter((m) => m.topic === '$SYS/broker/regions/SFO');
+      assert.ok(sfoRegionMsgs.length > 0, 'Expected $SYS/broker/regions/SFO to be published after observer moved region');
+
+      // Verify the observer is NOT muted on Broker B by connecting directly to Broker B and publishing
+      const obsJwtB = await createPeerJwt(obsKey, 'broker-b.local', 3600);
+      const obsClientB = await connectMqttWsClient(
+        `ws://127.0.0.1:${portB}`,
+        'obs_direct_b',
+        `v1_${obsKey.publicKeyHex}`,
+        obsJwtB
+      );
+      clients.push(obsClientB);
+
+      await obsClientB.publish(
+        topicSfo,
+        JSON.stringify({
+          origin_id: obsKey.publicKeyHex,
+          seq: 'direct-after-backlog',
+        })
+      );
+      await new Promise((r) => setTimeout(r, 200));
+
+      const directDelivered = subB.received.filter((m) => m.payload.includes('direct-after-backlog'));
+      assert.strictEqual(
+        directDelivered.length,
+        1,
+        'Observer must remain unmuted on Broker B after draining 1,200-packet peer backlog'
+      );
+    } finally {
+      for (const c of clients) c.close();
+      for (const s of activeSockets) s.destroy();
+      await new Promise<void>((resolve) => proxyServer.close(() => resolve()));
       for (const p of brokers) {
         p.kill();
         await new Promise((resolve) => p.once('exit', resolve));

@@ -62,6 +62,7 @@ export class SysMetricsCollector {
   private unauthorizedPublishes = 0;
   private staleStatusFiltered = 0;
   private duplicatesFiltered = 0;
+  private peerRateLimited = 0;
 
   // Traffic counters
   private totalMessagesReceived = 0;
@@ -180,6 +181,13 @@ export class SysMetricsCollector {
    */
   public recordDuplicateFiltered(): void {
     this.duplicatesFiltered++;
+  }
+
+  /**
+   * Record an inbound peer packet dropped due to PEER_RATE_LIMIT_PER_SEC
+   */
+  public recordPeerRateLimited(): void {
+    this.peerRateLimited++;
   }
 
   /**
@@ -488,6 +496,7 @@ export class SysMetricsCollector {
       bySubtopic: { ...this.subtopicCounts },
       staleStatusFiltered: this.staleStatusFiltered,
       duplicatesFiltered: this.duplicatesFiltered,
+      peerRateLimited: this.peerRateLimited,
     };
 
     const securityJson = {
@@ -514,6 +523,7 @@ export class SysMetricsCollector {
     const peersJson = {
       timestamp: nowMs,
       inboundConnectedPeers: connectedPeers,
+      inboundRateLimited: this.peerRateLimited,
       outboundPeersCount: Object.keys(outboundPeerStats).length,
       outbound: outboundPeerStats,
     };
@@ -553,6 +563,7 @@ export class SysMetricsCollector {
         messagesPerSec1m: rates.messagesPerSec1m,
         bytesPerSec1m: rates.bytesPerSec1m,
         duplicatesFiltered: this.duplicatesFiltered,
+        peerRateLimited: this.peerRateLimited,
       },
       security: {
         authFailures: this.authFailures,
@@ -642,6 +653,7 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/traffic/by_subtopic/internal', String(this.subtopicCounts.internal));
     this.publishRetained('$SYS/broker/traffic/stale_status_filtered', String(this.staleStatusFiltered));
     this.publishRetained('$SYS/broker/traffic/duplicates_filtered', String(this.duplicatesFiltered));
+    this.publishRetained('$SYS/broker/traffic/peer_rate_limited', String(this.peerRateLimited));
 
     // Security topics
     this.publishRetained('$SYS/broker/security', JSON.stringify(securityJson));

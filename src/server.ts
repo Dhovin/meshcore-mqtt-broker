@@ -228,7 +228,9 @@ const peerRateBuckets = new Map<string, { tokens: number; lastRefill: number }>(
 
 function checkPeerRateLimit(peerKey: string): boolean {
   const rate = peerConfig.peerRateLimitPerSec || 500;
-  const capacity = Math.max(rate * 2, 100);
+  // Set burst capacity at or above PEER_QUEUE_MAX_SIZE so a full recovery backlog drain
+  // is accepted without dropping packets, while sustained floods beyond `rate` are capped.
+  const capacity = Math.max(peerConfig.maxQueueSize || 5000, rate * 2, 100);
   const now = Date.now();
   let bucket = peerRateBuckets.get(peerKey);
   if (!bucket) {
@@ -666,13 +668,16 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
           `${logPrefix} [RATE_LIMIT] Dropped peer packet exceeding PEER_RATE_LIMIT_PER_SEC (${peerConfig.peerRateLimitPerSec}/s)`
         );
       }
+      sysMetrics.recordPeerRateLimited();
       dropPacketSilently(packet, callback);
       return;
     }
 
     const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
     if (!validation.valid) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (${validation.error})`);
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (${validation.error})`);
+      }
       sysMetrics.recordUnauthorizedPublish();
       dropPacketSilently(packet, callback);
       return;
@@ -706,9 +711,7 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       }
 
       if (trustState) {
-        if (!trustState.currentIata) {
-          trustState.currentIata = locationCode;
-        }
+        trustState.currentIata = locationCode;
         const allowed = abuseDetector.recordPacket(
           { publicKey: originKey } as any,
           packet,
@@ -817,7 +820,9 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
     // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is dropped silently
     if (subtopic === 'internal' || subtopic.startsWith('internal/') || subtopic.includes('/internal')) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (clients cannot publish to /internal directly)`);
+      }
       sysMetrics.recordUnauthorizedPublish();
       dropPacketSilently(packet, callback);
       return;
@@ -825,7 +830,9 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
     // Enforce subtopic allowlist without disconnecting the client
     if (!ALLOWED_PUBLISHER_SUBTOPICS.has(subtopic)) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (disallowed subtopic: ${subtopic})`);
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish dropped -> ${packet.topic} (disallowed subtopic: ${subtopic})`);
+      }
       sysMetrics.recordUnauthorizedPublish();
       dropPacketSilently(packet, callback);
       return;

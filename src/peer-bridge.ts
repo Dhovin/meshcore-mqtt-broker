@@ -27,7 +27,10 @@ export interface PeerState {
   keepaliveTimer?: NodeJS.Timeout;
   tokenRefreshTimer?: NodeJS.Timeout;
   connackTimer?: NodeJS.Timeout;
+  drainTimer?: NodeJS.Timeout;
   awaitingPingresp: boolean;
+  sendTokens: number;
+  lastTokenRefill: number;
 }
 
 // Subtopics allowed for broker-to-broker forwarding
@@ -147,6 +150,7 @@ export class PeerBridgeManager {
   private maxQueueSize: number;
   private maxQueueBytes: number;
   private queueTtlMs: number;
+  private peerRateLimitPerSec: number;
   private identity?: PeerKeyPair;
   private shuttingDown: boolean = false;
   private debugLog: boolean;
@@ -155,6 +159,7 @@ export class PeerBridgeManager {
     this.maxQueueSize = config.maxQueueSize || 5000;
     this.maxQueueBytes = config.maxQueueBytes || 8388608; // 8 MiB default
     this.queueTtlMs = config.queueTtlMs || 600000;        // 10 min default
+    this.peerRateLimitPerSec = config.peerRateLimitPerSec || 500;
     this.identity = identity;
     this.debugLog = debugLog;
 
@@ -164,9 +169,10 @@ export class PeerBridgeManager {
     }
 
     console.log(
-      `[PEER_BRIDGE] Initializing ${config.peers.length} outbound peer bridge(s) (queue limit: ${this.maxQueueSize} pkts / ${Math.round(this.maxQueueBytes / 1048576)} MiB, TTL: ${Math.round(this.queueTtlMs / 1000)}s)`
+      `[PEER_BRIDGE] Initializing ${config.peers.length} outbound peer bridge(s) (queue limit: ${this.maxQueueSize} pkts / ${Math.round(this.maxQueueBytes / 1048576)} MiB, TTL: ${Math.round(this.queueTtlMs / 1000)}s, rate: ${this.peerRateLimitPerSec}/s)`
     );
 
+    const now = Date.now();
     for (const target of config.peers) {
       const peerState: PeerState = {
         target,
@@ -179,6 +185,8 @@ export class PeerBridgeManager {
         totalDropped: 0,
         reconnectAttempts: 0,
         awaitingPingresp: false,
+        sendTokens: Math.max(this.peerRateLimitPerSec, DRAIN_BATCH_SLICE),
+        lastTokenRefill: now,
       };
       this.peers.set(target.id, peerState);
       void this.connectPeer(peerState);
@@ -198,6 +206,25 @@ export class PeerBridgeManager {
       clearTimeout(peerState.connackTimer);
       peerState.connackTimer = undefined;
     }
+    if (peerState.drainTimer) {
+      clearTimeout(peerState.drainTimer);
+      peerState.drainTimer = undefined;
+    }
+  }
+
+  private consumeSendToken(peerState: PeerState, now: number = Date.now()): boolean {
+    const rate = this.peerRateLimitPerSec;
+    const capacity = Math.max(rate, DRAIN_BATCH_SLICE);
+    const elapsedSec = Math.max(0, (now - peerState.lastTokenRefill) / 1000);
+    if (elapsedSec > 0) {
+      peerState.sendTokens = Math.min(capacity, peerState.sendTokens + elapsedSec * rate);
+      peerState.lastTokenRefill = now;
+    }
+    if (peerState.sendTokens < 1) {
+      return false;
+    }
+    peerState.sendTokens -= 1;
+    return true;
   }
 
   private scheduleReconnect(peerState: PeerState, overrideDelayMs?: number): void {
@@ -437,7 +464,7 @@ export class PeerBridgeManager {
   }
 
   /**
-   * Drain queued packets in asynchronous slices via setImmediate while respecting ws.bufferedAmount.
+   * Drain queued packets in asynchronous slices while respecting ws.bufferedAmount and peerRateLimitPerSec pacing.
    */
   private drainQueue(peerState: PeerState): void {
     if (peerState.draining || !peerState.connected || !peerState.ws || peerState.queue.length === 0) {
@@ -454,6 +481,7 @@ export class PeerBridgeManager {
     console.log(`${logPrefix} Draining ${peerState.queue.length} queued packet(s) (${peerState.queuedBytes} bytes)...`);
 
     const drainSlice = () => {
+      peerState.drainTimer = undefined;
       if (
         this.shuttingDown ||
         !peerState.connected ||
@@ -464,12 +492,13 @@ export class PeerBridgeManager {
         return;
       }
 
-      this.pruneExpiredQueue(peerState);
+      const now = Date.now();
+      this.pruneExpiredQueue(peerState, now);
 
       // Pause if WebSocket outgoing buffer is full
       if (peerState.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
-        const retryTimer = setTimeout(drainSlice, 25);
-        if (retryTimer.unref) retryTimer.unref();
+        peerState.drainTimer = setTimeout(drainSlice, 25);
+        if (peerState.drainTimer.unref) peerState.drainTimer.unref();
         return;
       }
 
@@ -477,7 +506,8 @@ export class PeerBridgeManager {
       while (
         peerState.queue.length > 0 &&
         sentInSlice < DRAIN_BATCH_SLICE &&
-        peerState.ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES
+        peerState.ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES &&
+        this.consumeSendToken(peerState, now)
       ) {
         const item = peerState.queue.shift()!;
         peerState.queuedBytes = Math.max(0, peerState.queuedBytes - item.byteSize);
@@ -486,7 +516,19 @@ export class PeerBridgeManager {
       }
 
       if (peerState.queue.length > 0) {
-        setImmediate(drainSlice);
+        if (peerState.ws.bufferedAmount > MAX_WS_BUFFERED_BYTES) {
+          peerState.drainTimer = setTimeout(drainSlice, 25);
+          if (peerState.drainTimer.unref) peerState.drainTimer.unref();
+        } else if (peerState.sendTokens < 1) {
+          const waitMs = Math.max(
+            5,
+            Math.min(25, Math.ceil(((1 - peerState.sendTokens) / this.peerRateLimitPerSec) * 1000))
+          );
+          peerState.drainTimer = setTimeout(drainSlice, waitMs);
+          if (peerState.drainTimer.unref) peerState.drainTimer.unref();
+        } else {
+          setImmediate(drainSlice);
+        }
       } else {
         peerState.draining = false;
       }
@@ -549,9 +591,10 @@ export class PeerBridgeManager {
         peerState.queue.length === 0 &&
         peerState.ws &&
         peerState.ws.readyState === WebSocket.OPEN &&
-        peerState.ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES
+        peerState.ws.bufferedAmount <= MAX_WS_BUFFERED_BYTES &&
+        this.consumeSendToken(peerState, now)
       ) {
-        // Connected, no backlog, and socket buffer healthy: send immediately
+        // Connected, no backlog, socket buffer healthy, and within rate limit: send immediately
         this.sendPublishFrame(peerState, packet.topic, payloadBuffer);
       } else {
         // Disconnected, draining backlog, or momentary socket backpressure: buffer in bounded queue
