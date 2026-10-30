@@ -55,7 +55,7 @@ Click **+ Add another Port, Variable, Line or Device**:
 
 ### Step 4: Add Path / Volume Mapping (Appdata Persistence)
 
-The container stores SQLite abuse-detection data in `/data/abuse-detection.db`. Host path mapping ensures database persistence across updates or array restarts.
+The container stores SQLite abuse-detection data in `/data/abuse-detection.db` and the broker's persistent Ed25519 peer keypair in `/data/peer-identity.json`. Host path mapping ensures database and public key persistence across container updates or array restarts.
 
 Click **+ Add another Port, Variable, Line or Device**:
 
@@ -115,17 +115,21 @@ Click **+ Add another Port, Variable, Line or Device** to create each variable r
 8. **Optional Standard TCP MQTT Listener (Optional)**:
    - **Config Type**: `Variable` | **Name**: `Enable TCP MQTT` | **Key**: `ENABLE_TCP_MQTT` | **Value**: `false` *(Set to `true` to enable plain TCP MQTT on `MQTT_TCP_PORT`, default `1883`)*
 
-9. **Abuse Enforcement (Optional)**:
+9. **Abuse Enforcement & Temporary Mute Timeout (Optional)**:
    - **Config Type**: `Variable`
    - **Name**: `Abuse Enforcement`
    - **Key**: `ABUSE_ENFORCEMENT_ENABLED`
-   - **Value**: `false` *(Set to `true` to mark offending clients as `'muted'` in `/internal` trust state)*
+   - **Value**: `false` *(Set to `true` to place offending clients in a temporary `'muted'` timeout for `ABUSE_MUTE_DURATION_MS` — default 4 hours — and silently drop their packets during the timeout)*
 
 10. **`$SYS` Telemetry Update Interval (Optional)**:
     - **Config Type**: `Variable`
     - **Name**: `SYS Telemetry Interval (ms)`
     - **Key**: `MQTT_SYS_INTERVAL_MS`
     - **Value**: `10000` *(Updates retained `$SYS/broker/#` topics every 10 seconds for Role 1 Admin subscribers)*
+
+11. **Peer Broker Interconnect (Optional)**:
+    - **Config Type**: `Variable` | **Name**: `Authorized Inbound Peers` | **Key**: `AUTHORIZED_PEERS` | **Value**: *(Comma-separated 64-char hex Ed25519 public keys of remote peer brokers allowed to push into this broker)*
+    - **Config Type**: `Variable` | **Name**: `Outbound Peer 1` | **Key**: `PEER_1` | **Value**: *(e.g. `wss://peer.yourdomain.com|peer.yourdomain.com`)*
 
 ---
 

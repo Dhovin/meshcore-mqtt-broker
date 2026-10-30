@@ -86,13 +86,16 @@ Scroll down to the **Environment variables** section in Portainer and click **+ 
 | `AUTH_EXPECTED_AUDIENCE` | `mqtt.yourdomain.com` | Expected JWT audience claim (leave empty to skip audience validation) |
 | `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` | `2` | Default max concurrent connections per subscriber account |
 | `SUBSCRIBER_1` | `viewer1:yourpassword:2` | Subscriber user (`user:pass:role:maxConns`, sequential from `SUBSCRIBER_1`) |
-| `SUBSCRIBER_2` | `admin:adminpassword:1:10` | Admin subscriber user (`1`=Admin, `2`=Full, `3`=Limited) |
+| `SUBSCRIBER_2` | `admin:adminpassword:1:10` | Subscriber user (`1`=Admin, `2`=Full, `3`=Limited, `4`=Peer) |
+| `AUTHORIZED_PEERS` | `7E76...9400` | *(Optional)* Comma-separated 64-char hex Ed25519 public keys of inbound peer brokers allowed to publish |
+| `PEER_1` | `wss://peer.domain.com\|peer.domain.com` | *(Optional)* Outbound peer target (`ws(s)://host[:port]\|targetAudience` or `ws(s)://host[:port]\|user\|pass`, sequential from `PEER_1`) |
 | `HTTP_REDIRECT_URL` | `https://yourdomain.com` | *(Optional)* Browser redirect URL for `/` (`/health` and `/healthz` always return 200 OK) |
 | `ENABLE_TCP_MQTT` | `false` | Enable/disable standard TCP MQTT on `MQTT_TCP_PORT` (default `1883`, unencrypted — use on private networks/localhost only) |
 | `MQTT_TCP_PORT` | `1883` | Port for optional standard TCP MQTT listener |
 | `MQTT_MAX_PACKET_BYTES` | `65536` | Max allowed MQTT publish payload size in bytes (64 KB default) |
 | `MQTT_SYS_INTERVAL_MS` | `10000` | Interval in ms between retained `$SYS/broker/#` telemetry updates for Admin subscribers (default 10s) |
-| `ABUSE_ENFORCEMENT_ENABLED` | `false` | When `true`, offending publishers are marked `'muted'` in `/internal` trust state |
+| `ABUSE_ENFORCEMENT_ENABLED` | `false` | When `true`, offending publishers are placed in a temporary `'muted'` timeout and their packets are silently dropped |
+| `ABUSE_MUTE_DURATION_MS` | `14400000` | Temporary mute timeout duration in ms (default 4 hours) before automatic unmute |
 | `ABUSE_STATE_RETENTION_MS` | `604800000` | Idle retention cutoff in ms (default 7 days) before inactive client trust states are evicted |
 
 ### Step 4: Deploy the Stack

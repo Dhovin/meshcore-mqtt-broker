@@ -41,7 +41,7 @@ Dokploy can deploy the broker using its `Dockerfile` / Docker Compose (recommend
    SUBSCRIBER_MAX_CONNECTIONS_DEFAULT=2
    
    # Add your subscriber users sequentially (format: username:password:role:maxConnections)
-   # Roles: 1=admin, 2=full_access, 3=limited (default if omitted)
+   # Roles: 1=admin, 2=full_access, 3=limited (default if omitted), 4=peer
    SUBSCRIBER_1=admin:your-secure-password-here:1:10
    SUBSCRIBER_2=viewer:another-password:2
    SUBSCRIBER_3=monitor:yet-another-password:3:D

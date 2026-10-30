@@ -161,8 +161,8 @@ SUBSCRIBER_N=username:password:role:maxConnections
 
 | Role | Access Level | Topic Access | Publish Permissions | Payload Filtering |
 | :--- | :--- | :--- | :--- | :--- |
-| **Role 1 (`admin`)** | Admin | All topics including `meshcore/#`, `/internal` (PII & trust state), `/serial/*`, and `$SYS/#` | Can publish empty retained messages (`retain: true`, 0-byte payload) to delete retained messages, and can publish to `meshcore/{IATA}/{PUBLIC_KEY}/serial/commands` | None (unfiltered) |
-| **Role 2 (`full_access`)** | Full Access | All public `meshcore/#` topics; blocked from `/internal`, `/serial/*`, and `$SYS/#` | None (subscribe-only) | None (unfiltered) |
+| **Role 1 (`admin`)** | Admin | All topics including `meshcore/#`, `/internal` (PII & trust state), `/serial/*`, and `$SYS/#` | Can publish empty retained messages (`retain: true`, 0-byte payload) to delete retained messages, publish to `meshcore/{IATA}/{PUBLIC_KEY}/serial/commands`, and publish bridge connection state notifications to `$SYS/broker/connection/#` | None (unfiltered) |
+| **Role 2 (`full_access`)** | Full Access | All public `meshcore/#` topics; blocked from `/internal`, `/serial/*`, and `$SYS/#` | Can publish bridge connection state notifications to `$SYS/broker/connection/#` (e.g., Mosquitto bridges); otherwise subscribe-only | None (unfiltered) |
 | **Role 3 (`limited`)** | Limited *(Default)* | All public `meshcore/#` topics; blocked from `/internal`, `/serial/*`, and `$SYS/#` | None (subscribe-only) | Sensitive fields stripped: `SNR`, `RSSI`, `score` removed from `/packets`; `stats`, `model`, `firmware_version` removed from `/status` |
 | **Role 4 (`peer`)** | Inbound Peer Broker | None (publish-only) | Can publish validated observer telemetry (`packets`, `status`, `neighbors`, `raw`) on `meshcore/{IATA}/{PUBLIC_KEY}/{subtopic}` | N/A |
 
@@ -172,7 +172,7 @@ Brokers can push local observer telemetry (`packets`, `status`, `neighbors`, `ra
 - **Strict Origin-Only Forwarding**: A broker **only** forwards packets published directly by its own local observers (`ClientType.PUBLISHER`). Packets received from another peer broker (`ClientType.PEER`) are never re-forwarded, preventing loops or duplicate hops in multi-peer topologies (e.g., `Broker A -> B & C` and `Broker C -> B`).
 - **Dual-Connected Observer Deduplication**: A SHA-256 cross-path deduplication cache (with TTL matched to `PEER_QUEUE_TTL_MS`, default 10 minutes) filters duplicate packets when an observer is simultaneously connected to multiple brokers, while preserving backup peer forwarding paths if a direct link is down.
 - **Two Peer Authentication Modes**:
-  1. **Ed25519 Public Key JWT (Recommended)**: Outbound broker signs a 24h JWT (auto-rotated every 12h) using `PEER_PRIVATE_KEY` (or an auto-generated identity persisted in `/data/peer-identity.json`, logged at startup). The receiving broker authorizes the peer by listing its 64-character hex public key in `AUTHORIZED_PEERS`.
+  1. **Ed25519 Public Key JWT (Recommended)**: Outbound broker signs a 24h JWT (auto-rotated every 12h) using `PEER_PRIVATE_KEY` (or a persistent Ed25519 identity auto-generated on startup in `/data/peer-identity.json`, whose 64-character hex public key is displayed in the startup banner and `$SYS/broker/public_key`). The receiving broker authorizes the peer by listing its 64-character hex public key in `AUTHORIZED_PEERS`.
      ```env
      # On Broker A (pushes to Broker B and Broker C):
      PEER_1=wss://broker-b.yourdomain.com|broker-b.yourdomain.com
@@ -383,9 +383,9 @@ cp .env.example .env
 | :--- | :---: | :--- | :--- |
 | `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` | **Yes** | `2` | Default max concurrent connections per subscriber username |
 | `SUBSCRIBER_1`, `SUBSCRIBER_2`, ... | No | — | Sequential accounts in format `username:password:role:maxConnections` (`role`: `1`=Admin, `2`=Full, `3`=Limited, `4`=Peer) |
-| `PEER_PRIVATE_KEY` | No | `""` | Optional 64-char or 128-char hex Ed25519 private key for outbound peer JWT signing (auto-generated in `/data/peer-identity.json` if omitted) |
+| `PEER_PRIVATE_KEY` | No | `""` | Optional 64-char or 128-char hex Ed25519 private key for outbound peer JWT signing (auto-generated on startup in `/data/peer-identity.json` and exposed in the startup banner + `$SYS/broker/public_key` if omitted) |
 | `AUTHORIZED_PEERS` | No | `""` | Comma-separated 64-char hex Ed25519 public keys of inbound peer brokers authorized to publish |
-| `PEER_1`, `PEER_2`, ... | No | — | Outbound peer targets: `ws(s)://host:port\|targetAudience` (Ed25519 JWT) or `ws(s)://host:port\|username\|password` (Role 4) |
+| `PEER_1`, `PEER_2`, ... | No | — | Outbound peer targets (with or without explicit port; supports `\|` or `:` delimiters): `ws(s)://host[:port]\|targetAudience` (Ed25519 JWT) or `ws(s)://host[:port]\|username\|password` (Role 4) |
 | `PEER_QUEUE_MAX_SIZE` | No | `5000` | Maximum queued packets per outbound peer during disconnects |
 | `PEER_QUEUE_MAX_BYTES` | No | `8388608` | Maximum queued bytes per outbound peer (`8 MiB`) |
 | `PEER_QUEUE_TTL_MS` | No | `600000` | Maximum packet age in outbound peer queue (`10 min`) |
