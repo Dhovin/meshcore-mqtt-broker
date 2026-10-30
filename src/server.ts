@@ -522,27 +522,6 @@ aedes.authenticate = async (client, username, password, callback) => {
       return;
     }
 
-    const isAuthorizedPeer = Boolean(
-      peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.has(publicKey)
-    );
-
-    // Reject reconnection attempts from Observers on the 1-minute unapproved-IATA blocklist
-    if (!isAuthorizedPeer) {
-      const blockStatus = observerRegionBlocklist.checkBlock(publicKey);
-      if (blockStatus.blocked) {
-        console.log(
-          `[O:${publicKey.substring(0, 8)}] [AUTH] ✗ Connection rejected - Observer temporarily blocked for unapproved IATA "${blockStatus.unapprovedIata}" (${blockStatus.remainingSeconds}s remaining)`
-        );
-        const stream = (client as any).conn;
-        if (stream) {
-          stream.regionBlocked = true;
-        }
-        sysMetrics.recordAuthFailure();
-        callback(null, false);
-        return;
-      }
-    }
-
     if (!passwordStr || passwordStr.length === 0) {
       console.log(`${logPrefix} [AUTH] ✗ No password provided`);
       sysMetrics.recordAuthFailure();
@@ -585,6 +564,20 @@ aedes.authenticate = async (client, username, password, callback) => {
       }
 
       callback(null, true);
+      return;
+    }
+
+    // Reject reconnection attempts from authenticated Observers on the 1-minute unapproved-IATA blocklist
+    const blockStatus = observerRegionBlocklist.checkBlock(publicKey);
+    if (blockStatus.blocked) {
+      console.log(
+        `[O:${shortKey}] [AUTH] ✗ Connection rejected - Observer temporarily blocked for unapproved IATA "${blockStatus.unapprovedIata}" (${blockStatus.remainingSeconds}s remaining)`
+      );
+      if (stream) {
+        stream.regionBlocked = true;
+      }
+      sysMetrics.recordAuthFailure();
+      callback(null, false);
       return;
     }
     
