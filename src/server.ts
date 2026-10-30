@@ -1260,7 +1260,7 @@ wsServer.on('connection', (ws, req) => {
     
     // Handle WebSocket errors
     ws.on('error', (error) => {
-      console.error(`[WEBSOCKET] Error from ${clientIP}:`, error.message);
+      console.error('[WEBSOCKET] Error from %s: %s', clientIP, error.message);
     });
     
     // Create per-connection MQTT packet validator with headroom for topic and header bytes
@@ -1426,7 +1426,7 @@ if (ENABLE_TCP) {
     });
 
     socket.on('error', (error: Error) => {
-      console.error(`[TCP] Error from ${clientIP}:`, error.message);
+      console.error('[TCP] Error from %s: %s', clientIP, error.message);
     });
 
     socket.on('close', () => {
