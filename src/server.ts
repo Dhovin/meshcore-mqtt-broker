@@ -253,8 +253,10 @@ function checkPeerRateLimit(peerKey: string): boolean {
 }
 
 // Bounded cross-path deduplication cache for non-status telemetry (packets, neighbors, raw)
-const DEDUP_TTL_MS = 120_000;
-const DEDUP_MAX_ENTRIES = 50_000;
+// Sized to at least PEER_QUEUE_TTL_MS (default 10m) so queued packets drained after an outage
+// are still deduplicated for dual-connected observers.
+const DEDUP_TTL_MS = Math.max(120_000, peerConfig.queueTtlMs || 600_000);
+const DEDUP_MAX_ENTRIES = 100_000;
 const seenPacketHashes = new Map<
   string,
   { timestamp: number; sourceId: string; forwardedByLocal: boolean }

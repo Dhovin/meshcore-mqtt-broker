@@ -154,7 +154,7 @@ Format:
 SUBSCRIBER_N=username:password:role:maxConnections
 ```
 - **Sequential Numbering**: Accounts must be numbered sequentially starting at `SUBSCRIBER_1` without gaps (`SUBSCRIBER_1`, `SUBSCRIBER_2`, `SUBSCRIBER_3`, ...). The broker stops loading at the first missing index.
-- **`role`**: `1` (Admin), `2` (Full Access), or `3` (Limited). Defaults to `3` (Limited) if omitted or invalid.
+- **`role`**: `1` (Admin), `2` (Full Access), `3` (Limited), or `4` (Peer). Defaults to `3` (Limited) if omitted or invalid.
 - **`maxConnections`**: Maximum concurrent connections allowed for this username. Specify a positive integer to override, or `D` / omit to use `SUBSCRIBER_MAX_CONNECTIONS_DEFAULT` (default: `2`).
 
 #### Subscriber Roles & Permissions
@@ -164,6 +164,28 @@ SUBSCRIBER_N=username:password:role:maxConnections
 | **Role 1 (`admin`)** | Admin | All topics including `meshcore/#`, `/internal` (PII & trust state), `/serial/*`, and `$SYS/#` | Can publish empty retained messages (`retain: true`, 0-byte payload) to delete retained messages, and can publish to `meshcore/{IATA}/{PUBLIC_KEY}/serial/commands` | None (unfiltered) |
 | **Role 2 (`full_access`)** | Full Access | All public `meshcore/#` topics; blocked from `/internal`, `/serial/*`, and `$SYS/#` | None (subscribe-only) | None (unfiltered) |
 | **Role 3 (`limited`)** | Limited *(Default)* | All public `meshcore/#` topics; blocked from `/internal`, `/serial/*`, and `$SYS/#` | None (subscribe-only) | Sensitive fields stripped: `SNR`, `RSSI`, `score` removed from `/packets`; `stats`, `model`, `firmware_version` removed from `/status` |
+| **Role 4 (`peer`)** | Inbound Peer Broker | None (publish-only) | Can publish validated observer telemetry (`packets`, `status`, `neighbors`, `raw`) on `meshcore/{IATA}/{PUBLIC_KEY}/{subtopic}` | N/A |
+
+### 3. Multi-Peer Origin-Only Forwarding (Broker-to-Broker Interconnect)
+
+Brokers can push local observer telemetry (`packets`, `status`, `neighbors`, `raw`) to one or more peer brokers over outbound MQTT-over-WebSocket connections (`PEER_1`, `PEER_2`, ...):
+- **Strict Origin-Only Forwarding**: A broker **only** forwards packets published directly by its own local observers (`ClientType.PUBLISHER`). Packets received from another peer broker (`ClientType.PEER`) are never re-forwarded, preventing loops or duplicate hops in multi-peer topologies (e.g., `Broker A -> B & C` and `Broker C -> B`).
+- **Dual-Connected Observer Deduplication**: A SHA-256 cross-path deduplication cache (with TTL matched to `PEER_QUEUE_TTL_MS`, default 10 minutes) filters duplicate packets when an observer is simultaneously connected to multiple brokers, while preserving backup peer forwarding paths if a direct link is down.
+- **Two Peer Authentication Modes**:
+  1. **Ed25519 Public Key JWT (Recommended)**: Outbound broker signs a 24h JWT (auto-rotated every 12h) using `PEER_PRIVATE_KEY` (or an auto-generated identity persisted in `/data/peer-identity.json`, logged at startup). The receiving broker authorizes the peer by listing its 64-character hex public key in `AUTHORIZED_PEERS`.
+     ```env
+     # On Broker A (pushes to Broker B and Broker C):
+     PEER_1=wss://broker-b.yourdomain.com|broker-b.yourdomain.com
+     PEER_2=wss://broker-c.yourdomain.com|broker-c.yourdomain.com
+
+     # On Broker C (accepts from Broker A, and pushes its own local observers to Broker B):
+     AUTHORIZED_PEERS=PUBLIC_KEY_OF_BROKER_A
+     PEER_1=wss://broker-b.yourdomain.com|broker-b.yourdomain.com
+
+     # On Broker B (accepts from both Broker A and Broker C):
+     AUTHORIZED_PEERS=PUBLIC_KEY_OF_BROKER_A,PUBLIC_KEY_OF_BROKER_C
+     ```
+  2. **Role 4 Username/Password**: Configure a `SUBSCRIBER_N=peer_user:peer_pass:4:2` account on the receiving broker and set `PEER_1=wss://broker-b.yourdomain.com|peer_user|peer_pass` on the sending broker.
 
 ---
 
@@ -198,7 +220,7 @@ Examples:
    - Standard subtopics (`packets`, `status`, `neighbors`, `raw`) must be valid UTF-8 JSON containing an `origin_id` field matching the authenticated `PUBLIC_KEY` (case-insensitive).
 4. **Peer Broker Trust Model & Rate Limiting**:
    - Authorized peer brokers (`AUTHORIZED_PEERS` Ed25519 public keys or Role 4 `PEER` accounts) are **trusted broker-to-broker links** that forward validated observer telemetry (`packets`, `status`, `neighbors`, `raw`) on behalf of their local observers (`origin_id` must match the `{PUBLIC_KEY}` in the topic). Only peer keys and credentials under trusted administrative control should be added to `AUTHORIZED_PEERS` or Role 4 accounts.
-   - Inbound peer traffic is rate-limited per peer identity via `PEER_RATE_LIMIT_PER_SEC` (default: `500` msg/s, with burst capacity set to `max(PEER_QUEUE_MAX_SIZE, 2 * PEER_RATE_LIMIT_PER_SEC)` so a full reconnect backlog drain is accepted without loss), while outbound queue draining is paced to `PEER_RATE_LIMIT_PER_SEC`. Peer-forwarded traffic does not charge the individual observer's local rate-limit bucket or duplicate-flood mute counter (preventing reconnect queue drains from muting active observers).
+   - Inbound peer traffic is rate-limited per peer identity via `PEER_RATE_LIMIT_PER_SEC` (default: `500` msg/s, with burst capacity set to `max(PEER_QUEUE_MAX_SIZE, 2 * PEER_RATE_LIMIT_PER_SEC)` so a full reconnect backlog drain is accepted without loss), while outbound queue draining is paced to `PEER_RATE_LIMIT_PER_SEC`. Keep `PEER_RATE_LIMIT_PER_SEC` and `PEER_QUEUE_MAX_SIZE` matched across peered brokers (or set the receiver's values at or above the sender's). Peer-forwarded traffic does not charge the individual observer's local rate-limit bucket or duplicate-flood mute counter (preventing reconnect queue drains from muting active observers).
 5. **Special Subtopic Behaviors**:
    - **`/status` (`meshcore/{IATA}/{PUBLIC_KEY}/status`)**:
      - **Retain Flag Stripping**: Any `retain: true` flag on `/status` messages (including Last Will and Testament / LWT offline messages) is automatically stripped so stale status payloads are never retained.
@@ -301,9 +323,10 @@ Tracks per-publisher behavioral metrics in memory and persists state to a SQLite
 - **Duplicate Packet Detection**: Computes SHA-256 hashes of payloads within a sliding window (`ABUSE_DUPLICATE_WINDOW_SIZE` / `ABUSE_DUPLICATE_WINDOW_MS`). Records anomalies if a single packet is seen more than `ABUSE_MAX_DUPLICATES_PER_PACKET` times or if the duplicate ratio exceeds `ABUSE_DUPLICATE_RATE_THRESHOLD` over `ABUSE_DUPLICATE_RATE_WINDOW_MS` (evaluated after at least 20 packets).
 - **Raw LoRa Packet Size Check**: If a published JSON message includes a hex-encoded `raw` field whose byte length (`raw.length / 2`) exceeds `ABUSE_MAX_PACKET_SIZE` (default `255` bytes), a `packet_size` anomaly is recorded.
 - **IATA Change Tracking**: Monitors how many times a publisher changes its `{IATA_CODE}` region within a rolling 24-hour window (`ABUSE_MAX_IATA_CHANGES_24H`).
-- **Telemetry & Enforcement (`ABUSE_ENFORCEMENT_ENABLED`)**:
-  - When `ABUSE_ENFORCEMENT_ENABLED=true`, exceeding rate limits, IATA change limits, or `ABUSE_ANOMALY_THRESHOLD` transitions the publisher's trust state `status` to `'muted'` (recording `mutedAt` and `muteReason`). When `false`, the broker logs `WOULD MUTE` and transitions `status` to `'would_mute'`.
-  - Trust metrics are published in real time to `meshcore/{IATA}/{PUBLIC_KEY}/internal` under `trust_state` and summarized in `$SYS/broker/security/abuse_detector` for administrative monitoring and downstream filtering.
+- **Telemetry, 4-Hour Temporary Mute Timeout & Enforcement (`ABUSE_ENFORCEMENT_ENABLED`, `ABUSE_MUTE_DURATION_MS`)**:
+  - When `ABUSE_ENFORCEMENT_ENABLED=true`, exceeding rate limits, IATA change limits, or `ABUSE_ANOMALY_THRESHOLD` places the publisher in a temporary `'muted'` timeout for `ABUSE_MUTE_DURATION_MS` (default `14400000` ms / 4 hours, recording `mutedAt`, `mutedUntil`, and `muteReason`). While muted, packets from that publisher are **silently dropped** without disconnecting its WebSocket connection (preventing client reconnect storms). When `ABUSE_ENFORCEMENT_ENABLED=false`, the broker logs `WOULD MUTE` and transitions `status` to `'would_mute'` for the same timeout window.
+  - Once `mutedUntil` expires, the publisher is **automatically restored** to `'allowed'` with a refreshed token bucket and reset short-term anomaly/duplicate counters.
+  - Trust metrics are published to `meshcore/{IATA}/{PUBLIC_KEY}/internal` (throttled to once every 30s per observer or immediately on status change) under `trust_state`, and active violators are listed in `$SYS/broker/security/abuse_detector/violators` and `$SYS/broker/security/abuse_detector`.
 - **Bounded Persistence**: State is saved to SQLite every `ABUSE_PERSISTENCE_INTERVAL_MS` (default 5 minutes) and on `SIGINT`/`SIGTERM` shutdown. Clients with no packet activity for longer than `ABUSE_STATE_RETENTION_MS` (default 7 days) are automatically evicted from memory and disk.
 
 ### 3. HTTP Health Check & Browser Redirect
