@@ -1,5 +1,7 @@
 import { config as dotenvConfig } from 'dotenv';
+import { getAirportInfo } from 'airport-utils';
 import { AbuseConfig } from './abuse-detector.js';
+import { parseAllowedRegions } from './region-filter.js';
 
 // Load environment variables
 dotenvConfig();
@@ -31,6 +33,25 @@ export function loadMqttConfig() {
       ? rawLogLevel
       : 'info';
 
+  let allowedRegions: Set<string> | null;
+  try {
+    allowedRegions = parseAllowedRegions(process.env.ALLOWED_REGIONS, (code) => {
+      try {
+        getAirportInfo(code);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+  } catch (err: any) {
+    console.error(`FATAL: ${err.message}`);
+    process.exit(1);
+  }
+
+  if (allowedRegions) {
+    console.log(`[CONFIG] Allowed ingestion regions (${allowedRegions.size}): ${Array.from(allowedRegions).join(', ')}`);
+  }
+
   return {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),
     tcpPort: parseInt(process.env.MQTT_TCP_PORT || '1883', 10),
@@ -41,6 +62,7 @@ export function loadMqttConfig() {
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
     sysIntervalMs: parseInt(process.env.MQTT_SYS_INTERVAL_MS || '10000', 10),
     logLevel,
+    allowedRegions,
   };
 }
 
