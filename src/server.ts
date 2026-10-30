@@ -17,6 +17,7 @@ import { MqttStreamValidator } from './mqtt-packet-validator.js';
 import { SysMetricsCollector, SubscriberAccountMeta } from './sys-metrics.js';
 import { PeerBridgeManager, validatePeerPacket } from './peer-bridge.js';
 import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto.js';
+import { ObserverRegionBlocklist, isRegionAllowed } from './region-filter.js';
 
 // Read broker version from package.json
 let brokerVersion = '1.1.0';
@@ -40,6 +41,7 @@ const ENABLE_TCP = mqttConfig.enableTcp;
 const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
+const ALLOWED_REGIONS = mqttConfig.allowedRegions;
 
 // Always initialize the broker's Ed25519 peer identity on startup (persisted in /data/peer-identity.json)
 // so its public key is immediately visible in the startup banner and $SYS telemetry.
@@ -175,6 +177,9 @@ const aedes = new Aedes({ id: 'broker' });
 // Rate limiting for failed connections
 const rateLimiter = new RateLimiter(60000, 10, 300000);
 
+// 1-minute temporary blocklist for Observers publishing unapproved IATA codes
+const observerRegionBlocklist = new ObserverRegionBlocklist(60000);
+
 // Abuse detection
 const abuseDetector = new AbuseDetector(abuseConfig);
 
@@ -183,6 +188,8 @@ const sysMetrics = new SysMetricsCollector({
   aedes,
   rateLimiter,
   abuseDetector,
+  observerRegionBlocklist,
+  allowedRegions: ALLOWED_REGIONS,
   subscriberAccounts: subscriberAccountsMeta,
   brokerVersion,
   brokerPublicKey: peerIdentity?.publicKeyHex,
@@ -515,6 +522,27 @@ aedes.authenticate = async (client, username, password, callback) => {
       return;
     }
 
+    const isAuthorizedPeer = Boolean(
+      peerConfig.authorizedPeerKeys && peerConfig.authorizedPeerKeys.has(publicKey)
+    );
+
+    // Reject reconnection attempts from Observers on the 1-minute unapproved-IATA blocklist
+    if (!isAuthorizedPeer) {
+      const blockStatus = observerRegionBlocklist.checkBlock(publicKey);
+      if (blockStatus.blocked) {
+        console.log(
+          `[O:${publicKey.substring(0, 8)}] [AUTH] ✗ Connection rejected - Observer temporarily blocked for unapproved IATA "${blockStatus.unapprovedIata}" (${blockStatus.remainingSeconds}s remaining)`
+        );
+        const stream = (client as any).conn;
+        if (stream) {
+          stream.regionBlocked = true;
+        }
+        sysMetrics.recordAuthFailure();
+        callback(null, false);
+        return;
+      }
+    }
+
     if (!passwordStr || passwordStr.length === 0) {
       console.log(`${logPrefix} [AUTH] ✗ No password provided`);
       sysMetrics.recordAuthFailure();
@@ -683,7 +711,11 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       return;
     }
 
-    const validation = validatePeerPacket(packet.topic, packet.payload, isValidIATACode);
+    const validation = validatePeerPacket(
+      packet.topic,
+      packet.payload,
+      (code) => Boolean(ALLOWED_REGIONS?.has(code)) || isValidIATACode(code)
+    );
     if (!validation.valid) {
       if (isDebug) {
         console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (${validation.error})`);
@@ -695,6 +727,20 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     }
 
     const locationCode = validation.normalizedLocation!;
+
+    // Enforce ALLOWED_REGIONS for inbound Peer traffic:
+    // Selectively drop unapproved IATA packets without disconnecting the Peer link.
+    if (!isRegionAllowed(locationCode, ALLOWED_REGIONS)) {
+      if (isDebug) {
+        console.log(
+          `${logPrefix} [REGION_FILTER] Dropped peer packet for unapproved region "${locationCode}" -> ${packet.topic}`
+        );
+      }
+      sysMetrics.recordInboundPeerRegionFiltered(client);
+      dropPacketSilently(packet, callback);
+      return;
+    }
+
     packet.topic = validation.normalizedTopic!;
     const subtopic = validation.subtopic!;
     const payloadBuf = ensureBuffer(packet.payload);
@@ -795,10 +841,15 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         return;
       }
       
-      // Then check if it's a valid IATA code
-      if (!isValidIATACode(locationCode)) {
+      // Then check if it's a valid IATA code (or explicitly permitted in ALLOWED_REGIONS)
+      if (!ALLOWED_REGIONS?.has(locationCode.toUpperCase()) && !isValidIATACode(locationCode)) {
         console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
         console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code: "${locationCode}"`);
+        if (ALLOWED_REGIONS && (client as any).publicKey) {
+          observerRegionBlocklist.block((client as any).publicKey.toUpperCase(), locationCode);
+          (client as any).will = null;
+          (client as any)._will = null;
+        }
         sysMetrics.recordUnauthorizedPublish();
         callback(new Error('Location must be a valid IATA international airport code or "test"'));
         client.close();
@@ -830,6 +881,28 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       return;
     }
 
+    const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
+
+    // Enforce ALLOWED_REGIONS for Observer connections:
+    // Immediately drop the packet, block the Observer's public key for 1 minute, and terminate the session.
+    if (!isRegionAllowed(normalizedLocation, ALLOWED_REGIONS)) {
+      console.log(
+        `${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unapproved IATA region: "${normalizedLocation}")`
+      );
+      console.log(
+        `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${normalizedLocation}"`
+      );
+      observerRegionBlocklist.block(clientPublicKey, normalizedLocation);
+      (client as any).will = null;
+      (client as any)._will = null;
+      packet.topic = '$drop';
+      packet.retain = false;
+      sysMetrics.recordUnauthorizedPublish();
+      callback(new Error(`IATA region "${normalizedLocation}" is not permitted on this broker`));
+      client.close();
+      return;
+    }
+
     const subtopic = topicParts.slice(3).join('/');
 
     // Protect /internal subtopic: only the broker may publish to /internal; direct client publishing is dropped silently
@@ -853,7 +926,6 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     }
 
     // Normalize the topic to UPPERCASE for IATA codes and public key component
-    const normalizedLocation = isTestRegion ? 'test' : locationCode.toUpperCase();
     const normalizedTopic = `meshcore/${normalizedLocation}/${clientPublicKey}/${subtopic}`;
     (client as any).currentIata = normalizedLocation;
     
@@ -1015,9 +1087,24 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     if (subscription.topic.endsWith('/serial/commands')) {
       const parts = subscription.topic.split('/');
       if (parts.length === 5 && parts[0] === 'meshcore' && parts[3] === 'serial') {
+        const iata = parts[1].trim();
         const topicPublicKey = parts[2].toUpperCase();
         const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
+          if (!isRegionAllowed(iata, ALLOWED_REGIONS)) {
+            console.log(
+              `${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unapproved IATA region: "${iata}")`
+            );
+            console.log(
+              `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${iata}"`
+            );
+            observerRegionBlocklist.block(clientPublicKey, iata);
+            (client as any).will = null;
+            (client as any)._will = null;
+            callback(new Error(`IATA region "${iata}" is not permitted on this broker`));
+            client.close();
+            return;
+          }
           console.log(`${logPrefix} [AUTHZ] ✓ Subscribe authorized (own serial/commands) -> ${subscription.topic}`);
           callback(null, subscription);
           return;
@@ -1433,6 +1520,7 @@ wsServer.on('connection', (ws, req) => {
       const clientInfo = (stream as any).client;
       const wasAuthenticated = (stream as any).authenticated;
       const isTrustedPeer = Boolean((stream as any).trustedPeer);
+      const isRegionBlocked = Boolean((stream as any).regionBlocked);
       const hasValidAuth = clientInfo && (clientInfo as any).clientType;
       
       if (hasValidAuth) {
@@ -1443,7 +1531,7 @@ wsServer.on('connection', (ws, req) => {
       } else {
         console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
         
-        if (!wasAuthenticated && !isTrustedPeer) {
+        if (!wasAuthenticated && !isTrustedPeer && !isRegionBlocked) {
           const blocked = rateLimiter.recordFailure(clientIP);
           if (blocked) {
             console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
@@ -1455,7 +1543,7 @@ wsServer.on('connection', (ws, req) => {
       }
     });
 
-    // Handle stream end
+    // Handle stream end or destroy (e.g. when Aedes calls client.close() -> conn.destroy())
     stream.on('end', () => {
       if (isDebug) {
         const clientInfo = (stream as any).client;
@@ -1467,6 +1555,12 @@ wsServer.on('connection', (ws, req) => {
         }
       }
       ws.close();
+    });
+
+    stream.on('close', () => {
+      if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+        ws.close();
+      }
     });
 
     // Pass the stream to Aedes
@@ -1520,6 +1614,7 @@ if (ENABLE_TCP) {
       const clientInfo = (socket as any).client;
       const wasAuthenticated = (socket as any).authenticated;
       const isTrustedPeer = Boolean((socket as any).trustedPeer);
+      const isRegionBlocked = Boolean((socket as any).regionBlocked);
       const hasValidAuth = clientInfo && (clientInfo as any).clientType;
 
       if (hasValidAuth) {
@@ -1529,7 +1624,7 @@ if (ENABLE_TCP) {
         }
       } else {
         console.log(`[C:${clientInfo?.id || 'null'}] [TCP] Connection closed (unauthenticated) from ${clientIP}`);
-        if (!wasAuthenticated && !isTrustedPeer) {
+        if (!wasAuthenticated && !isTrustedPeer && !isRegionBlocked) {
           const blocked = rateLimiter.recordFailure(clientIP);
           if (blocked) {
             console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
@@ -1572,6 +1667,11 @@ httpServer.listen(WS_PORT, HOST, () => {
   }
   console.log(`$SYS Telemetry Interval:    ${mqttConfig.sysIntervalMs}ms (Admin-only, retained)`);
   console.log(`Log Level:                  ${mqttConfig.logLevel}`);
+  console.log(
+    `Allowed Regions:            ${
+      ALLOWED_REGIONS ? `${Array.from(ALLOWED_REGIONS).join(', ')} (${ALLOWED_REGIONS.size})` : 'ALL (unrestricted)'
+    }`
+  );
   console.log('');
   console.log('Authentication Modes:');
   console.log(`  1. Subscribers (Subscribe-only): ${subscriberUsers.size} user(s) configured`);
@@ -1611,6 +1711,7 @@ function shutdown(): void {
   }
   httpServer.close();
   rateLimiter.destroy();
+  observerRegionBlocklist.destroy();
   abuseDetector.shutdown();
   aedes.close(() => {
     console.log('[SHUTDOWN] Broker closed');

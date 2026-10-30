@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks';
 import type { RateLimiter } from './rate-limiter.js';
 import type { AbuseDetector } from './abuse-detector.js';
 import type { OutboundPeerStats } from './peer-bridge.js';
+import type { ObserverRegionBlocklist } from './region-filter.js';
 
 // 60 buckets of 5 seconds each = 300 seconds (5 minutes) rolling window
 const BUCKET_DURATION_MS = 5000;
@@ -34,12 +35,15 @@ export interface InboundPeerRecord {
   duplicatesFiltered: number;
   rateLimited: number;
   invalidDropped: number;
+  regionFiltered: number;
 }
 
 export interface SysMetricsOptions {
   aedes: Aedes;
   rateLimiter: RateLimiter;
   abuseDetector: AbuseDetector;
+  observerRegionBlocklist?: ObserverRegionBlocklist;
+  allowedRegions?: Set<string> | null;
   subscriberAccounts: Map<string, SubscriberAccountMeta>;
   brokerVersion: string;
   brokerPublicKey?: string;
@@ -55,6 +59,8 @@ export class SysMetricsCollector {
   private readonly aedes: Aedes;
   private readonly rateLimiter: RateLimiter;
   private readonly abuseDetector: AbuseDetector;
+  private readonly observerRegionBlocklist?: ObserverRegionBlocklist;
+  private readonly allowedRegions: string[] | null;
   private readonly subscriberAccounts: Map<string, SubscriberAccountMeta>;
   private readonly versionString: string;
   private readonly brokerPublicKey?: string;
@@ -88,6 +94,7 @@ export class SysMetricsCollector {
   private inboundPeerBytesReceived = 0;
   private inboundPeerDuplicatesFiltered = 0;
   private inboundPeerInvalidDropped = 0;
+  private inboundPeerRegionFiltered = 0;
   private readonly inboundPeers = new Map<string, InboundPeerRecord>();
 
   // Traffic counters
@@ -118,6 +125,8 @@ export class SysMetricsCollector {
     this.aedes = options.aedes;
     this.rateLimiter = options.rateLimiter;
     this.abuseDetector = options.abuseDetector;
+    this.observerRegionBlocklist = options.observerRegionBlocklist;
+    this.allowedRegions = options.allowedRegions ? Array.from(options.allowedRegions).sort() : null;
     this.subscriberAccounts = options.subscriberAccounts;
     this.brokerPublicKey = options.brokerPublicKey;
     this.authorizedPeerKeysCount = options.authorizedPeerKeysCount ?? 0;
@@ -259,6 +268,16 @@ export class SysMetricsCollector {
     rec.lastSeenAt = Date.now();
   }
 
+  /**
+   * Record an inbound peer packet dropped due to ALLOWED_REGIONS filtering
+   */
+  public recordInboundPeerRegionFiltered(client: any): void {
+    this.inboundPeerRegionFiltered++;
+    const rec = this.getOrCreateInboundPeerRecord(client);
+    rec.regionFiltered++;
+    rec.lastSeenAt = Date.now();
+  }
+
   private getOrCreateInboundPeerRecord(client: any): InboundPeerRecord {
     const pubKey: string | undefined = client?.publicKey;
     const username: string | undefined = client?.username;
@@ -283,6 +302,7 @@ export class SysMetricsCollector {
         duplicatesFiltered: 0,
         rateLimited: 0,
         invalidDropped: 0,
+        regionFiltered: 0,
       };
       this.inboundPeers.set(id, rec);
     } else {
@@ -505,6 +525,15 @@ export class SysMetricsCollector {
     // 3. Abuse detector & regional summary (single-pass in AbuseDetector)
     const abuseSummary = this.abuseDetector.getAllStats();
     const rateLimiterStats = this.rateLimiter.getStats();
+    const regionBlocklistStats = this.observerRegionBlocklist
+      ? this.observerRegionBlocklist.getStats()
+      : {
+          blockedObserverCount: 0,
+          totalBlocksIssued: 0,
+          totalBlockedReconnects: 0,
+          blockDurationSeconds: 60,
+          blockedObservers: [],
+        };
     const outboundPeerStats = this.getPeerStats ? this.getPeerStats() : {};
 
     // Merge connected publishers per IATA with 1h/tracked stats from AbuseDetector
@@ -610,6 +639,12 @@ export class SysMetricsCollector {
       authFailures: this.authFailures,
       unauthorizedPublishes: this.unauthorizedPublishes,
       rateLimiter: rateLimiterStats,
+      regionFilter: {
+        enabled: this.allowedRegions !== null,
+        allowedRegions: this.allowedRegions,
+        peerPacketsDropped: this.inboundPeerRegionFiltered,
+        observerBlocklist: regionBlocklistStats,
+      },
       abuseDetector: {
         enforcementEnabled: abuseSummary.enforcementEnabled,
         muteDurationSeconds: abuseSummary.muteDurationSeconds,
@@ -666,6 +701,7 @@ export class SysMetricsCollector {
         duplicatesFiltered: rec.duplicatesFiltered,
         rateLimited: rec.rateLimited,
         invalidDropped: rec.invalidDropped,
+        regionFiltered: rec.regionFiltered,
       };
     }
 
@@ -683,6 +719,7 @@ export class SysMetricsCollector {
         duplicatesFiltered: this.inboundPeerDuplicatesFiltered,
         rateLimited: this.peerRateLimited,
         invalidDropped: this.inboundPeerInvalidDropped,
+        regionFiltered: this.inboundPeerRegionFiltered,
         peers: inboundPeersSnapshot,
       },
       outboundConnectedPeers: outboundConnectedCount,
@@ -702,6 +739,7 @@ export class SysMetricsCollector {
 
     const regionsJson = {
       timestamp: nowMs,
+      allowedRegions: this.allowedRegions,
       activeRegionCount,
       totalTrackedRegions: allIatas.size,
       regions: regionsData,
@@ -723,6 +761,7 @@ export class SysMetricsCollector {
         tcp: tcpConnections,
       },
       regions: {
+        allowedRegions: this.allowedRegions,
         activeRegionCount,
         connectedByRegion: Object.fromEntries(
           Object.entries(regionsData)
@@ -741,6 +780,7 @@ export class SysMetricsCollector {
       security: {
         authFailures: this.authFailures,
         blockedIPs: rateLimiterStats.blockedIPCount,
+        blockedObservers: regionBlocklistStats.blockedObserverCount,
         mutedPublishers: abuseSummary.mutedPublishersCount,
         wouldMutePublishers: abuseSummary.wouldMutePublishersCount,
         violatorsCount: abuseSummary.violators.length,
@@ -800,6 +840,7 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/peers/inbound/duplicates_filtered', String(this.inboundPeerDuplicatesFiltered));
     this.publishRetained('$SYS/broker/peers/inbound/rate_limited', String(this.peerRateLimited));
     this.publishRetained('$SYS/broker/peers/inbound/invalid_dropped', String(this.inboundPeerInvalidDropped));
+    this.publishRetained('$SYS/broker/peers/inbound/region_filtered', String(this.inboundPeerRegionFiltered));
 
     for (const [peerId, peerData] of Object.entries(inboundPeersSnapshot)) {
       this.publishRetained(`$SYS/broker/peers/inbound/${peerId}`, JSON.stringify(peerData));
@@ -808,6 +849,7 @@ export class SysMetricsCollector {
       this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/received_bytes`, String(peerData.bytesReceived));
       this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/duplicates_filtered`, String(peerData.duplicatesFiltered));
       this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/rate_limited`, String(peerData.rateLimited));
+      this.publishRetained(`$SYS/broker/peers/inbound/${peerId}/region_filtered`, String(peerData.regionFiltered));
     }
 
     this.publishRetained('$SYS/broker/peers/outbound_connected', String(outboundConnectedCount));
@@ -833,6 +875,10 @@ export class SysMetricsCollector {
 
     // Regional topics
     this.publishRetained('$SYS/broker/regions', JSON.stringify(regionsJson));
+    this.publishRetained(
+      '$SYS/broker/regions/allowed',
+      this.allowedRegions ? this.allowedRegions.join(',') : 'ALL'
+    );
     this.publishRetained('$SYS/broker/regions/active_count', String(activeRegionCount));
 
     for (const [iata, data] of Object.entries(regionsData)) {
@@ -877,6 +923,9 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/security/rate_limiter/blocked_ips_count', String(rateLimiterStats.blockedIPCount));
     this.publishRetained('$SYS/broker/security/rate_limiter/tracked_ips_count', String(rateLimiterStats.trackedIPCount));
     this.publishRetained('$SYS/broker/security/rate_limiter/total_blocked_attempts', String(rateLimiterStats.totalBlockedAttempts));
+    this.publishRetained('$SYS/broker/security/region_filter', JSON.stringify(securityJson.regionFilter));
+    this.publishRetained('$SYS/broker/security/region_filter/blocked_observers_count', String(regionBlocklistStats.blockedObserverCount));
+    this.publishRetained('$SYS/broker/security/region_filter/peer_packets_dropped', String(this.inboundPeerRegionFiltered));
     this.publishRetained('$SYS/broker/security/abuse_detector', JSON.stringify(securityJson.abuseDetector));
     this.publishRetained('$SYS/broker/security/abuse_detector/violators', JSON.stringify(abuseSummary.violators));
     this.publishRetained('$SYS/broker/security/abuse_detector/muted_count', String(abuseSummary.mutedPublishersCount));
