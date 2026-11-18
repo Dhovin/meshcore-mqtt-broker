@@ -125,6 +125,17 @@ export class RateLimiter {
   }
 
   /**
+   * Clear transient pre-auth failure tracking for an IP after a successful authentication.
+   * Active blocks are preserved until they expire.
+   */
+  recordSuccess(ip: string): void {
+    const record = this.failedConnectionsByIP.get(ip);
+    if (record && !record.blockedUntil) {
+      this.failedConnectionsByIP.delete(ip);
+    }
+  }
+
+  /**
    * Record a failed connection attempt from an IP
    * Returns true if the IP should now be blocked
    */

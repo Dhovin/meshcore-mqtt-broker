@@ -38,6 +38,48 @@ export interface InboundPeerRecord {
   regionFiltered: number;
 }
 
+export type DisconnectReason =
+  | 'keepalive_timeout'
+  | 'ws_ping_timeout'
+  | 'client_error'
+  | 'packet_validation'
+  | 'duplicate_client_id'
+  | 'transport_close'
+  | 'clean_disconnect'
+  | 'unknown';
+
+export interface DisconnectEventInfo {
+  clientId?: string;
+  clientType?: string;
+  publicKey?: string;
+  username?: string;
+  ip?: string;
+  transport?: string;
+  durationSeconds?: number;
+  reason?: DisconnectReason;
+  error?: string;
+  wsCloseCode?: number;
+}
+
+export interface ClientChurnRecord {
+  key: string;
+  clientId: string;
+  clientType: string;
+  publicKey: string | null;
+  disconnectCount: number;
+  shortSessionCount: number;
+  lastReason: DisconnectReason;
+  lastError: string | null;
+  lastWsCloseCode: number | null;
+  lastDurationSeconds: number | null;
+  lastIp: string | null;
+  lastTransport: string | null;
+  lastDisconnectedAt: number;
+}
+
+const MAX_CHURN_RECORDS = 500;
+const TOP_CHURN_PUBLISH_COUNT = 20;
+
 export interface SysMetricsOptions {
   aedes: Aedes;
   rateLimiter: RateLimiter;
@@ -83,11 +125,34 @@ export class SysMetricsCollector {
   private maximumClients = 0;
   private totalConnections = 0;
   private totalDisconnects = 0;
+  private connectionErrors = 0;
   private authFailures = 0;
   private unauthorizedPublishes = 0;
   private staleStatusFiltered = 0;
   private duplicatesFiltered = 0;
   private peerRateLimited = 0;
+
+  // Disconnect diagnostics
+  private readonly disconnectsByReason: Record<DisconnectReason, number> = {
+    keepalive_timeout: 0,
+    ws_ping_timeout: 0,
+    client_error: 0,
+    packet_validation: 0,
+    duplicate_client_id: 0,
+    transport_close: 0,
+    clean_disconnect: 0,
+    unknown: 0,
+  };
+  private readonly wsCloseCodes = new Map<string, number>();
+  private readonly sessionDurations = {
+    under10s: 0,
+    under60s: 0,
+    under5m: 0,
+    over5m: 0,
+  };
+  private totalSessionDurationSeconds = 0;
+  private timedSessionCount = 0;
+  private readonly clientChurn = new Map<string, ClientChurnRecord>();
 
   // Inbound peer tracking
   private inboundPeerPacketsReceived = 0;
@@ -186,10 +251,79 @@ export class SysMetricsCollector {
   }
 
   /**
-   * Record a client disconnection
+   * Record a client disconnection with optional reason and session metadata
    */
-  public recordClientDisconnected(): void {
+  public recordClientDisconnected(info?: DisconnectEventInfo): void {
     this.totalDisconnects++;
+    const reason: DisconnectReason = info?.reason ?? 'unknown';
+    this.disconnectsByReason[reason] = (this.disconnectsByReason[reason] ?? 0) + 1;
+
+    if (info?.wsCloseCode !== undefined) {
+      const codeKey = String(info.wsCloseCode);
+      if (this.wsCloseCodes.size < 50 || this.wsCloseCodes.has(codeKey)) {
+        this.wsCloseCodes.set(codeKey, (this.wsCloseCodes.get(codeKey) ?? 0) + 1);
+      }
+    }
+
+    const dur = info?.durationSeconds;
+    if (dur !== undefined && Number.isFinite(dur) && dur >= 0) {
+      this.totalSessionDurationSeconds += dur;
+      this.timedSessionCount++;
+      if (dur < 10) this.sessionDurations.under10s++;
+      else if (dur < 60) this.sessionDurations.under60s++;
+      else if (dur < 300) this.sessionDurations.under5m++;
+      else this.sessionDurations.over5m++;
+    }
+
+    const clientKey = info?.publicKey || info?.username || info?.clientId;
+    if (clientKey) {
+      const now = Date.now();
+      const existing = this.clientChurn.get(clientKey);
+      const isShort = dur !== undefined && dur < 60;
+      if (existing) {
+        existing.disconnectCount++;
+        if (isShort) existing.shortSessionCount++;
+        existing.clientId = info?.clientId || existing.clientId;
+        existing.clientType = info?.clientType || existing.clientType;
+        existing.lastReason = reason;
+        existing.lastError = info?.error ?? null;
+        existing.lastWsCloseCode = info?.wsCloseCode ?? null;
+        existing.lastDurationSeconds = dur ?? null;
+        existing.lastIp = info?.ip ?? existing.lastIp;
+        existing.lastTransport = info?.transport ?? existing.lastTransport;
+        existing.lastDisconnectedAt = now;
+        // Refresh insertion order for LRU eviction
+        this.clientChurn.delete(clientKey);
+        this.clientChurn.set(clientKey, existing);
+      } else {
+        if (this.clientChurn.size >= MAX_CHURN_RECORDS) {
+          const oldestKey = this.clientChurn.keys().next().value;
+          if (oldestKey) this.clientChurn.delete(oldestKey);
+        }
+        this.clientChurn.set(clientKey, {
+          key: clientKey,
+          clientId: info?.clientId || clientKey,
+          clientType: info?.clientType || 'unknown',
+          publicKey: info?.publicKey ?? null,
+          disconnectCount: 1,
+          shortSessionCount: isShort ? 1 : 0,
+          lastReason: reason,
+          lastError: info?.error ?? null,
+          lastWsCloseCode: info?.wsCloseCode ?? null,
+          lastDurationSeconds: dur ?? null,
+          lastIp: info?.ip ?? null,
+          lastTransport: info?.transport ?? null,
+          lastDisconnectedAt: now,
+        });
+      }
+    }
+  }
+
+  /**
+   * Record a pre-CONNECT protocol/connection error
+   */
+  public recordConnectionError(): void {
+    this.connectionErrors++;
   }
 
   /**
@@ -598,6 +732,8 @@ export class SysMetricsCollector {
       activeSubscriptions,
     };
 
+    const disconnectStats = this.getDisconnectSnapshot(nowMs);
+
     const clientsJson = {
       timestamp: nowMs,
       connected: connectedClients,
@@ -618,6 +754,12 @@ export class SysMetricsCollector {
       byTransport: {
         websocket: wsConnections,
         tcp: tcpConnections,
+      },
+      disconnects: {
+        total: this.totalDisconnects,
+        connectionErrors: this.connectionErrors,
+        avgDurationSeconds: disconnectStats.avgDurationSeconds,
+        byReason: disconnectStats.byReason,
       },
     };
 
@@ -827,6 +969,9 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/clients/total_connections', String(this.totalConnections));
     this.publishRetained('$SYS/broker/clients/total_disconnects', String(this.totalDisconnects));
     this.publishRetained('$SYS/broker/clients/subscribers_by_account', JSON.stringify(subscribersByAccount));
+    this.publishRetained('$SYS/broker/clients/disconnects', JSON.stringify(disconnectStats));
+    this.publishRetained('$SYS/broker/clients/disconnects/by_reason', JSON.stringify(disconnectStats.byReason));
+    this.publishRetained('$SYS/broker/clients/disconnects/churning', JSON.stringify(disconnectStats.topChurning));
 
     // Peers topics
     this.publishRetained('$SYS/broker/peers', JSON.stringify(peersJson));
@@ -933,6 +1078,51 @@ export class SysMetricsCollector {
     this.publishRetained('$SYS/broker/security/abuse_detector/anomalies_total', String(abuseSummary.totalAnomalies));
     this.publishRetained('$SYS/broker/security/abuse_detector/duplicates_total', String(abuseSummary.totalDuplicates));
     this.publishRetained('$SYS/broker/security/abuse_detector/silenced_total', String(abuseSummary.totalPacketsSilenced));
+  }
+
+  /**
+   * Build a snapshot of disconnect reasons, session durations, and top churning clients
+   */
+  public getDisconnectSnapshot(nowMs: number = Date.now()) {
+    const wsCloseCodes: Record<string, number> = {};
+    for (const [code, count] of this.wsCloseCodes.entries()) {
+      wsCloseCodes[code] = count;
+    }
+
+    const avgDurationSeconds =
+      this.timedSessionCount > 0
+        ? Math.round((this.totalSessionDurationSeconds / this.timedSessionCount) * 10) / 10
+        : 0;
+
+    const topChurning = Array.from(this.clientChurn.values())
+      .sort((a, b) => b.disconnectCount - a.disconnectCount || b.lastDisconnectedAt - a.lastDisconnectedAt)
+      .slice(0, TOP_CHURN_PUBLISH_COUNT)
+      .map((rec) => ({
+        clientId: rec.clientId,
+        clientType: rec.clientType,
+        publicKey: rec.publicKey,
+        disconnectCount: rec.disconnectCount,
+        shortSessionCount: rec.shortSessionCount,
+        lastReason: rec.lastReason,
+        lastError: rec.lastError,
+        lastWsCloseCode: rec.lastWsCloseCode,
+        lastDurationSeconds: rec.lastDurationSeconds,
+        lastIp: rec.lastIp,
+        lastTransport: rec.lastTransport,
+        lastDisconnectedAt: new Date(rec.lastDisconnectedAt).toISOString(),
+      }));
+
+    return {
+      timestamp: nowMs,
+      total: this.totalDisconnects,
+      connectionErrors: this.connectionErrors,
+      avgDurationSeconds,
+      byReason: { ...this.disconnectsByReason },
+      wsCloseCodes,
+      sessionDurations: { ...this.sessionDurations },
+      trackedChurnClients: this.clientChurn.size,
+      topChurning,
+    };
   }
 
   /**

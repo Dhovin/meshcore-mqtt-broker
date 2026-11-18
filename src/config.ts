@@ -19,6 +19,13 @@ function validateRequiredEnvVars(vars: string[]): void {
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+function parseNonNegativeIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
+}
+
 // Validate and load MQTT configuration
 export function loadMqttConfig() {
   validateRequiredEnvVars([
@@ -55,6 +62,10 @@ export function loadMqttConfig() {
     httpRedirectUrl: process.env.HTTP_REDIRECT_URL ? process.env.HTTP_REDIRECT_URL.trim() : '',
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
     sysIntervalMs: parseInt(process.env.MQTT_SYS_INTERVAL_MS || '10000', 10),
+    connectTimeoutMs: parseNonNegativeIntEnv('MQTT_CONNECT_TIMEOUT_MS', 60000),
+    wsPingIntervalMs: parseNonNegativeIntEnv('MQTT_WS_PING_INTERVAL_MS', 30000),
+    wsPingTimeoutMs: parseNonNegativeIntEnv('MQTT_WS_PING_TIMEOUT_MS', 90000),
+    tcpKeepaliveMs: parseNonNegativeIntEnv('MQTT_TCP_KEEPALIVE_MS', 30000),
     logLevel,
     allowedRegions,
   };

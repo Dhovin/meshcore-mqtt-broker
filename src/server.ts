@@ -14,7 +14,7 @@ import { AbuseDetector } from './abuse-detector.js';
 import { loadMqttConfig, loadAbuseConfig, loadSubscriberConfig, loadPeerConfig } from './config.js';
 import { timingSafeCompare } from './crypto-utils.js';
 import { MqttStreamValidator } from './mqtt-packet-validator.js';
-import { SysMetricsCollector, SubscriberAccountMeta } from './sys-metrics.js';
+import { SysMetricsCollector, SubscriberAccountMeta, DisconnectReason } from './sys-metrics.js';
 import { PeerBridgeManager, validatePeerPacket } from './peer-bridge.js';
 import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto.js';
 import { ObserverRegionBlocklist, isRegionAllowed } from './region-filter.js';
@@ -172,7 +172,10 @@ if (subscriberUsers.size === 0) {
 }
 
 // Create Aedes MQTT broker with fixed 'broker' ID so built-in $SYS topics group cleanly under $SYS/broker/...
-const aedes = new Aedes({ id: 'broker' });
+const aedes = new Aedes({
+  id: 'broker',
+  connectTimeout: mqttConfig.connectTimeoutMs,
+});
 
 // Rate limiting for failed connections
 const rateLimiter = new RateLimiter(60000, 10, 300000);
@@ -443,6 +446,20 @@ function getClientLogPrefix(client: any): string {
   return `[C:${client.id}]`;
 }
 
+function finalizeAuthSuccess(client: any, trustedPeer = false): void {
+  const stream = client?.conn;
+  if (stream && stream.clientIP) {
+    stream.authenticated = true;
+    stream.client = client;
+    if (trustedPeer) stream.trustedPeer = true;
+    rateLimiter.recordSuccess(stream.clientIP);
+  }
+  const existing = (aedes as any).clients?.[client.id];
+  if (existing && existing !== client && !(existing as any).disconnectReason) {
+    (existing as any).disconnectReason = 'duplicate_client_id';
+  }
+}
+
 // Authentication handler
 aedes.authenticate = async (client, username, password, callback) => {
   const logPrefix = `[C:${client.id}]`;
@@ -486,13 +503,8 @@ aedes.authenticate = async (client, username, password, callback) => {
           (client as any).role = role;
         }
         
-        // Mark stream as authenticated
-        const stream = (client as any).conn;
-        if (stream && stream.clientIP) {
-          stream.authenticated = true;
-          stream.trustedPeer = role === SubscriberRole.PEER;
-          stream.client = client;
-        }
+        // Mark stream as authenticated and clear transient IP failure history
+        finalizeAuthSuccess(client, role === SubscriberRole.PEER);
         
         callback(null, true);
       } else {
@@ -557,11 +569,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       (client as any).tokenPayload = tokenPayload;
       (client as any).clientType = ClientType.PEER;
 
-      if (stream && stream.clientIP) {
-        stream.authenticated = true;
-        stream.trustedPeer = true;
-        stream.client = client;
-      }
+      finalizeAuthSuccess(client, true);
 
       callback(null, true);
       return;
@@ -587,11 +595,8 @@ aedes.authenticate = async (client, username, password, callback) => {
     (client as any).tokenPayload = tokenPayload;
     (client as any).clientType = ClientType.PUBLISHER;
     
-    // Mark stream as authenticated
-    if (stream && stream.clientIP) {
-      stream.authenticated = true;
-      stream.client = client;
-    }
+    // Mark stream as authenticated and clear transient IP failure history
+    finalizeAuthSuccess(client);
     
     // Initialize abuse detection tracking
     const clientIP = stream?.clientIP;
@@ -1289,11 +1294,42 @@ aedes.on('client', (client) => {
 aedes.on('clientDisconnect', (client) => {
   const logPrefix = getClientLogPrefix(client);
   const connectedAt = (client as any).connectedAt;
-  const duration = connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : 'unknown';
-  
-  console.log(`${logPrefix} [CLIENT] Disconnected (connected for ${duration}s)`);
-  sysMetrics.recordClientDisconnected();
-  
+  const durationSec = connectedAt ? Math.max(0, Math.round((Date.now() - connectedAt) / 1000)) : undefined;
+  const stream = (client as any).stream || (client as any).conn;
+  const wsCloseCode: number | undefined = stream?.wsCloseCode;
+
+  let reason: DisconnectReason =
+    (client as any).disconnectReason ||
+    stream?.disconnectReason ||
+    'unknown';
+
+  if (reason === 'unknown') {
+    if (wsCloseCode === 1000) {
+      reason = 'clean_disconnect';
+    } else if (wsCloseCode !== undefined || stream?.transport === 'tcp') {
+      reason = 'transport_close';
+    }
+  }
+
+  const errorMsg: string | undefined = (client as any).lastError || stream?.lastError;
+  console.log(
+    `${logPrefix} [CLIENT] Disconnected (connected for ${durationSec ?? 'unknown'}s, reason: ${reason}` +
+    `${wsCloseCode !== undefined ? `, wsCode: ${wsCloseCode}` : ''})`
+  );
+
+  sysMetrics.recordClientDisconnected({
+    clientId: client?.id,
+    clientType: (client as any)?.clientType,
+    publicKey: (client as any)?.publicKey,
+    username: (client as any)?.username,
+    ip: stream?.clientIP,
+    transport: stream?.transport,
+    durationSeconds: durationSec,
+    reason,
+    error: errorMsg,
+    wsCloseCode,
+  });
+
   if (client) {
     if (isDebug) {
       console.log(`${logPrefix} [CLIENT] Disconnect details - clientType: ${(client as any).clientType}, publicKey: ${(client as any).publicKey?.substring(0, 8)}`);
@@ -1347,9 +1383,26 @@ aedes.on('subscribe', (subscriptions, client) => {
   console.log(`${logPrefix} [SUBSCRIBE] Attempting to subscribe to: ${subscriptions.map(s => s.topic).join(', ')}`);
 });
 
+aedes.on('keepaliveTimeout', (client) => {
+  const logPrefix = getClientLogPrefix(client);
+  (client as any).disconnectReason = 'keepalive_timeout';
+  console.log(`${logPrefix} [KEEPALIVE] Client keepalive timeout`);
+});
+
 aedes.on('clientError', (client, err) => {
   const logPrefix = getClientLogPrefix(client);
+  if (!(client as any).disconnectReason) {
+    (client as any).disconnectReason =
+      err.message === 'keep alive timeout' ? 'keepalive_timeout' : 'client_error';
+  }
+  (client as any).lastError = err.message;
   console.log(`${logPrefix} [ERROR] Client error: ${err.message}`);
+});
+
+aedes.on('connectionError', (client, err) => {
+  const ip = (client as any)?.conn?.clientIP || 'unknown';
+  sysMetrics.recordConnectionError();
+  console.log(`[C:${client?.id || 'unauth'}] [ERROR] Connection error from ${ip}: ${err.message}`);
 });
 
 // Create HTTP server for WebSocket
@@ -1411,8 +1464,11 @@ wsServer.on('connection', (ws, req) => {
       console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
     }
   
+    let lastActivityAt = Date.now();
+
     // Enable WebSocket ping/pong to keep connection alive
     ws.on('ping', (data) => {
+      lastActivityAt = Date.now();
       if (isDebug) {
         console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
       }
@@ -1420,6 +1476,7 @@ wsServer.on('connection', (ws, req) => {
     });
     
     ws.on('pong', () => {
+      lastActivityAt = Date.now();
       if (isDebug) {
         console.log(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
       }
@@ -1472,6 +1529,7 @@ wsServer.on('connection', (ws, req) => {
 
     // Forward WebSocket messages to the stream with validation and backpressure handling
     ws.on('message', (data) => {
+      lastActivityAt = Date.now();
       const buf = Buffer.isBuffer(data)
         ? data
         : Array.isArray(data)
@@ -1482,6 +1540,8 @@ wsServer.on('connection', (ws, req) => {
       if (valErr) {
         const clientInfo = (stream as any).client;
         const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+        (stream as any).disconnectReason = 'packet_validation';
+        (stream as any).lastError = valErr.message;
         console.log(`${logPrefix} [MQTT] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
         ws.terminate();
         stream.destroy();
@@ -1507,9 +1567,41 @@ wsServer.on('connection', (ws, req) => {
     (stream as any).clientIP = clientIP;
     (stream as any).transport = 'websocket';
     (stream as any).authenticated = false;
+
+    // Periodically ping WebSocket clients so reverse proxies/Cloudflare Tunnels/NATs do not drop idle connections
+    let wsPingTimer: NodeJS.Timeout | undefined;
+    if (mqttConfig.wsPingIntervalMs > 0) {
+      wsPingTimer = setInterval(() => {
+        if (ws.readyState !== ws.OPEN) return;
+        const idleMs = Date.now() - lastActivityAt;
+        if (mqttConfig.wsPingTimeoutMs > 0 && idleMs > mqttConfig.wsPingTimeoutMs) {
+          const clientInfo = (stream as any).client;
+          const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+          (stream as any).disconnectReason = 'ws_ping_timeout';
+          (stream as any).lastError = `No WebSocket activity for ${Math.round(idleMs / 1000)}s`;
+          console.log(`${logPrefix} [WEBSOCKET] Ping timeout after ${Math.round(idleMs / 1000)}s from ${clientIP}`);
+          ws.terminate();
+          return;
+        }
+        try {
+          ws.ping();
+        } catch {
+          // Ignore send errors; close handler will clean up
+        }
+      }, mqttConfig.wsPingIntervalMs);
+      if (wsPingTimer.unref) {
+        wsPingTimer.unref();
+      }
+    }
     
     // Handle WebSocket close
     ws.on('close', (code, reason) => {
+      if (wsPingTimer) {
+        clearInterval(wsPingTimer);
+        wsPingTimer = undefined;
+      }
+      (stream as any).wsCloseCode = code;
+      (stream as any).wsCloseReason = reason.toString() || undefined;
       const clientInfo = (stream as any).client;
       const wasAuthenticated = (stream as any).authenticated;
       const isTrustedPeer = Boolean((stream as any).trustedPeer);
@@ -1587,6 +1679,12 @@ if (ENABLE_TCP) {
     (socket as any).clientIP = clientIP;
     (socket as any).transport = 'tcp';
     (socket as any).authenticated = false;
+    if (typeof socket.setNoDelay === 'function') {
+      socket.setNoDelay(true);
+    }
+    if (mqttConfig.tcpKeepaliveMs > 0 && typeof socket.setKeepAlive === 'function') {
+      socket.setKeepAlive(true, mqttConfig.tcpKeepaliveMs);
+    }
 
     const packetValidator = new MqttStreamValidator(mqttConfig.maxPacketBytes + 4096);
     socket.on('data', (chunk: Buffer) => {
@@ -1594,6 +1692,8 @@ if (ENABLE_TCP) {
       if (valErr) {
         const clientInfo = (socket as any).client;
         const logPrefix = clientInfo ? getClientLogPrefix(clientInfo) : '[C:unauth]';
+        (socket as any).disconnectReason = 'packet_validation';
+        (socket as any).lastError = valErr.message;
         console.log(`${logPrefix} [TCP] ✗ Connection dropped: ${valErr.message} from ${clientIP}`);
         socket.destroy();
       }
