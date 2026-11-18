@@ -180,6 +180,35 @@ const aedes = new Aedes({
 // Rate limiting for failed connections
 const rateLimiter = new RateLimiter(60000, 10, 300000);
 
+// Cap concurrent pre-auth connections per IP to bound idle unauthenticated sockets
+const unauthConnectionsByIP = new Map<string, number>();
+
+function tryAcquireUnauthSlot(ip: string): boolean {
+  const current = unauthConnectionsByIP.get(ip) || 0;
+  if (current >= mqttConfig.maxUnauthConnectionsPerIp) {
+    return false;
+  }
+  unauthConnectionsByIP.set(ip, current + 1);
+  return true;
+}
+
+function releaseUnauthSlot(streamOrSocket: any): void {
+  if (!streamOrSocket || streamOrSocket.unauthSlotReleased) return;
+  streamOrSocket.unauthSlotReleased = true;
+  const ip = streamOrSocket.clientIP;
+  if (!ip) return;
+  const current = unauthConnectionsByIP.get(ip) || 0;
+  if (current <= 1) {
+    unauthConnectionsByIP.delete(ip);
+  } else {
+    unauthConnectionsByIP.set(ip, current - 1);
+  }
+}
+
+// Throttle noisy pre-CONNECT connectionError logs per IP
+const CONN_ERROR_LOG_WINDOW_MS = 30000;
+const lastConnErrorLogByIP = new Map<string, { timestamp: number; suppressed: number }>();
+
 // 1-minute temporary blocklist for Observers publishing unapproved IATA codes
 const observerRegionBlocklist = new ObserverRegionBlocklist(60000);
 
@@ -446,17 +475,29 @@ function getClientLogPrefix(client: any): string {
   return `[C:${client.id}]`;
 }
 
-function finalizeAuthSuccess(client: any, trustedPeer = false): void {
+function finalizeAuthSuccess(client: any, trustedPeer = false, authIdentity?: string): void {
   const stream = client?.conn;
   if (stream && stream.clientIP) {
     stream.authenticated = true;
     stream.client = client;
     if (trustedPeer) stream.trustedPeer = true;
-    rateLimiter.recordSuccess(stream.clientIP);
+    releaseUnauthSlot(stream);
+    rateLimiter.recordSuccess(stream.clientIP, authIdentity);
   }
   const existing = (aedes as any).clients?.[client.id];
   if (existing && existing !== client && !(existing as any).disconnectReason) {
     (existing as any).disconnectReason = 'duplicate_client_id';
+  }
+}
+
+function recordClientAuthFailure(client: any, usernameStr?: string): void {
+  sysMetrics.recordAuthFailure();
+  const stream = client?.conn;
+  if (stream?.clientIP && !stream.regionBlocked) {
+    const blocked = rateLimiter.recordAuthFailure(stream.clientIP, usernameStr || undefined);
+    if (blocked) {
+      console.log(`[RATE_LIMIT] IP ${stream.clientIP} has been blocked after repeated auth failures`);
+    }
   }
 }
 
@@ -470,6 +511,11 @@ aedes.authenticate = async (client, username, password, callback) => {
   try {
     const usernameStr = username?.toString() || '';
     const passwordStr = password?.toString() || '';
+    const authStream = (client as any).conn;
+    if (authStream) {
+      authStream.authAttempted = true;
+      authStream.attemptedUsername = usernameStr;
+    }
 
     // Check if this is a subscriber or role-4 peer login
     if (subscriberUsers.has(usernameStr)) {
@@ -481,7 +527,7 @@ aedes.authenticate = async (client, username, password, callback) => {
         
         if (activeConns.size >= maxConn) {
           console.log(`${logPrefix} [AUTH] ✗ Subscriber connection limit exceeded (${usernameStr}, ${activeConns.size}/${maxConn})`);
-          sysMetrics.recordAuthFailure();
+          recordClientAuthFailure(client, usernameStr);
           callback(null, false);
           return;
         }
@@ -503,13 +549,13 @@ aedes.authenticate = async (client, username, password, callback) => {
           (client as any).role = role;
         }
         
-        // Mark stream as authenticated and clear transient IP failure history
-        finalizeAuthSuccess(client, role === SubscriberRole.PEER);
+        // Mark stream as authenticated and apply scoped rate-limiter decay
+        finalizeAuthSuccess(client, role === SubscriberRole.PEER, usernameStr);
         
         callback(null, true);
       } else {
         console.log(`${logPrefix} [AUTH] ✗ Subscriber authentication failed - Invalid password`);
-        sysMetrics.recordAuthFailure();
+        recordClientAuthFailure(client, usernameStr);
         callback(null, false);
       }
       return;
@@ -519,7 +565,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Username format: v1_{UPPERCASE_PUBLIC_KEY}
     if (!usernameStr.startsWith('v1_')) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid username format: ${usernameStr}`);
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
@@ -529,14 +575,14 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Validate public key format (should be 64 hex characters)
     if (!/^[0-9A-F]{64}$/i.test(publicKey)) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid public key format: ${publicKey}`);
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
 
     if (!passwordStr || passwordStr.length === 0) {
       console.log(`${logPrefix} [AUTH] ✗ No password provided`);
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
@@ -546,7 +592,7 @@ aedes.authenticate = async (client, username, password, callback) => {
 
     if (!tokenPayload) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid token signature for public key: ${publicKey.substring(0, 8)}...`);
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
@@ -554,7 +600,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     // Validate audience claim if configured
     if (EXPECTED_AUDIENCE && tokenPayload.aud !== EXPECTED_AUDIENCE) {
       console.log(`${logPrefix} [AUTH] ✗ Invalid audience: ${tokenPayload.aud} (expected: ${EXPECTED_AUDIENCE})`);
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
@@ -569,7 +615,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       (client as any).tokenPayload = tokenPayload;
       (client as any).clientType = ClientType.PEER;
 
-      finalizeAuthSuccess(client, true);
+      finalizeAuthSuccess(client, true, usernameStr);
 
       callback(null, true);
       return;
@@ -584,7 +630,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       if (stream) {
         stream.regionBlocked = true;
       }
-      sysMetrics.recordAuthFailure();
+      recordClientAuthFailure(client, usernameStr);
       callback(null, false);
       return;
     }
@@ -595,8 +641,8 @@ aedes.authenticate = async (client, username, password, callback) => {
     (client as any).tokenPayload = tokenPayload;
     (client as any).clientType = ClientType.PUBLISHER;
     
-    // Mark stream as authenticated and clear transient IP failure history
-    finalizeAuthSuccess(client);
+    // Mark stream as authenticated and apply scoped rate-limiter decay
+    finalizeAuthSuccess(client, false, usernameStr);
     
     // Initialize abuse detection tracking
     const clientIP = stream?.clientIP;
@@ -605,7 +651,7 @@ aedes.authenticate = async (client, username, password, callback) => {
     callback(null, true);
   } catch (error) {
     console.error(`${logPrefix} [AUTH] Error during authentication:`, error);
-    sysMetrics.recordAuthFailure();
+    recordClientAuthFailure(client);
     callback(null, false);
   }
 };
@@ -1304,12 +1350,23 @@ aedes.on('clientDisconnect', (client) => {
     'unknown';
 
   if (reason === 'unknown') {
-    if (wsCloseCode === 1000) {
+    if (Boolean((client as any)._disconnected)) {
       reason = 'clean_disconnect';
+    } else if (wsCloseCode === 1000 || wsCloseCode === 1005) {
+      reason = 'clean_disconnect';
+    } else if (wsCloseCode === 1006) {
+      reason = 'abnormal_close_1006';
+    } else if (wsCloseCode === 1009) {
+      reason = 'payload_too_big_1009';
+    } else if (wsCloseCode === 1001) {
+      reason = 'going_away_1001';
     } else if (wsCloseCode !== undefined || stream?.transport === 'tcp') {
       reason = 'transport_close';
     }
   }
+
+  (client as any).disconnectRecorded = true;
+  (client as any).recordedWsCloseCode = wsCloseCode;
 
   const errorMsg: string | undefined = (client as any).lastError || stream?.lastError;
   console.log(
@@ -1402,7 +1459,25 @@ aedes.on('clientError', (client, err) => {
 aedes.on('connectionError', (client, err) => {
   const ip = (client as any)?.conn?.clientIP || 'unknown';
   sysMetrics.recordConnectionError();
-  console.log(`[C:${client?.id || 'unauth'}] [ERROR] Connection error from ${ip}: ${err.message}`);
+
+  if (isDebug) {
+    console.log(`[C:${client?.id || 'unauth'}] [ERROR] Connection error from ${ip}: ${err.message}`);
+    return;
+  }
+
+  const now = Date.now();
+  const entry = lastConnErrorLogByIP.get(ip);
+  if (!entry || now - entry.timestamp >= CONN_ERROR_LOG_WINDOW_MS) {
+    const suppressedNote = entry && entry.suppressed > 0 ? ` (${entry.suppressed} suppressed)` : '';
+    if (!entry && lastConnErrorLogByIP.size >= 1000) {
+      const oldestKey = lastConnErrorLogByIP.keys().next().value;
+      if (oldestKey) lastConnErrorLogByIP.delete(oldestKey);
+    }
+    lastConnErrorLogByIP.set(ip, { timestamp: now, suppressed: 0 });
+    console.log(`[C:${client?.id || 'unauth'}] [ERROR] Connection error from ${ip}: ${err.message}${suppressedNote}`);
+  } else {
+    entry.suppressed++;
+  }
 });
 
 // Create HTTP server for WebSocket
@@ -1450,6 +1525,7 @@ const wsServer = new WebSocketServer({
 });
 
 wsServer.on('connection', (ws, req) => {
+  let slotRef: any = null;
   try {
     const clientIP = getClientIP(req);
     
@@ -1459,6 +1535,14 @@ wsServer.on('connection', (ws, req) => {
       ws.terminate();
       return;
     }
+
+    // Cap concurrent pre-auth sockets per IP
+    if (!tryAcquireUnauthSlot(clientIP)) {
+      console.log(`[RATE_LIMIT] Rejecting WebSocket from ${clientIP}: too many concurrent unauthenticated connections`);
+      ws.terminate();
+      return;
+    }
+    slotRef = { clientIP, unauthSlotReleased: false };
     
     if (isDebug) {
       console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
@@ -1480,11 +1564,6 @@ wsServer.on('connection', (ws, req) => {
       if (isDebug) {
         console.log(`[WEBSOCKET] Received WebSocket PONG from ${clientIP}`);
       }
-    });
-    
-    // Handle WebSocket errors
-    ws.on('error', (error) => {
-      console.error('[WEBSOCKET] Error from %s: %s', clientIP, error.message);
     });
     
     // Create per-connection MQTT packet validator with headroom for topic and header bytes
@@ -1527,6 +1606,22 @@ wsServer.on('connection', (ws, req) => {
       }
     });
 
+    // Store client IP and transport on stream for logging and $SYS metrics
+    (stream as any).clientIP = clientIP;
+    (stream as any).transport = 'websocket';
+    (stream as any).authenticated = false;
+    (stream as any).unauthSlotReleased = false;
+    slotRef = stream;
+
+    // Handle WebSocket errors (including 1009 maxPayload exceeded)
+    ws.on('error', (error: any) => {
+      if (error?.code === 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH' || /max payload size exceeded/i.test(error?.message || '')) {
+        (stream as any).disconnectReason = 'payload_too_big_1009';
+        (stream as any).lastError = error.message;
+      }
+      console.error('[WEBSOCKET] Error from %s: %s', clientIP, error.message);
+    });
+
     // Forward WebSocket messages to the stream with validation and backpressure handling
     ws.on('message', (data) => {
       lastActivityAt = Date.now();
@@ -1563,16 +1658,11 @@ wsServer.on('connection', (ws, req) => {
       }
     });
 
-    // Store client IP and transport on stream for logging and $SYS metrics
-    (stream as any).clientIP = clientIP;
-    (stream as any).transport = 'websocket';
-    (stream as any).authenticated = false;
-
-    // Periodically ping WebSocket clients so reverse proxies/Cloudflare Tunnels/NATs do not drop idle connections
+    // Periodically ping ONLY authenticated WebSocket clients so reverse proxies/Cloudflare Tunnels/NATs do not drop idle connections
     let wsPingTimer: NodeJS.Timeout | undefined;
     if (mqttConfig.wsPingIntervalMs > 0) {
       wsPingTimer = setInterval(() => {
-        if (ws.readyState !== ws.OPEN) return;
+        if (ws.readyState !== ws.OPEN || !(stream as any).authenticated) return;
         const idleMs = Date.now() - lastActivityAt;
         if (mqttConfig.wsPingTimeoutMs > 0 && idleMs > mqttConfig.wsPingTimeoutMs) {
           const clientInfo = (stream as any).client;
@@ -1600,15 +1690,24 @@ wsServer.on('connection', (ws, req) => {
         clearInterval(wsPingTimer);
         wsPingTimer = undefined;
       }
+      releaseUnauthSlot(stream);
       (stream as any).wsCloseCode = code;
       (stream as any).wsCloseReason = reason.toString() || undefined;
+      if (code === 1009 && !(stream as any).disconnectReason) {
+        (stream as any).disconnectReason = 'payload_too_big_1009';
+      }
       const clientInfo = (stream as any).client;
       const wasAuthenticated = (stream as any).authenticated;
+      const authAttempted = Boolean((stream as any).authAttempted);
       const isTrustedPeer = Boolean((stream as any).trustedPeer);
       const isRegionBlocked = Boolean((stream as any).regionBlocked);
       const hasValidAuth = clientInfo && (clientInfo as any).clientType;
       
       if (hasValidAuth) {
+        if ((clientInfo as any).disconnectRecorded && (clientInfo as any).recordedWsCloseCode === undefined) {
+          const clientKey = (clientInfo as any).publicKey || (clientInfo as any).username || clientInfo.id;
+          sysMetrics.recordLateWsCloseCode(clientKey, code);
+        }
         if (isDebug) {
           const logPrefix = getClientLogPrefix(clientInfo);
           console.log(`${logPrefix} [WEBSOCKET] Connection closed from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
@@ -1616,7 +1715,7 @@ wsServer.on('connection', (ws, req) => {
       } else {
         console.log(`[C:${clientInfo?.id || 'null'}] [WEBSOCKET] Connection closed (unauthenticated) from ${clientIP} - Code: ${code}, Reason: ${reason.toString() || 'none'}`);
         
-        if (!wasAuthenticated && !isTrustedPeer && !isRegionBlocked) {
+        if (!wasAuthenticated && !authAttempted && !isTrustedPeer && !isRegionBlocked) {
           const blocked = rateLimiter.recordFailure(clientIP);
           if (blocked) {
             console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);
@@ -1651,6 +1750,7 @@ wsServer.on('connection', (ws, req) => {
     // Pass the stream to Aedes
     aedes.handle(stream);
   } catch (error) {
+    releaseUnauthSlot(slotRef);
     console.error('[WEBSOCKET] Error handling connection:', error);
     try {
       ws.terminate();
@@ -1673,12 +1773,19 @@ if (ENABLE_TCP) {
       return;
     }
 
+    if (!tryAcquireUnauthSlot(clientIP)) {
+      console.log(`[RATE_LIMIT] Rejecting TCP connection from ${clientIP}: too many concurrent unauthenticated connections`);
+      socket.destroy();
+      return;
+    }
+
     if (isDebug) {
       console.log(`[TCP] New TCP MQTT connection from ${clientIP}`);
     }
     (socket as any).clientIP = clientIP;
     (socket as any).transport = 'tcp';
     (socket as any).authenticated = false;
+    (socket as any).unauthSlotReleased = false;
     if (typeof socket.setNoDelay === 'function') {
       socket.setNoDelay(true);
     }
@@ -1704,8 +1811,10 @@ if (ENABLE_TCP) {
     });
 
     socket.on('close', () => {
+      releaseUnauthSlot(socket);
       const clientInfo = (socket as any).client;
       const wasAuthenticated = (socket as any).authenticated;
+      const authAttempted = Boolean((socket as any).authAttempted);
       const isTrustedPeer = Boolean((socket as any).trustedPeer);
       const isRegionBlocked = Boolean((socket as any).regionBlocked);
       const hasValidAuth = clientInfo && (clientInfo as any).clientType;
@@ -1717,7 +1826,7 @@ if (ENABLE_TCP) {
         }
       } else {
         console.log(`[C:${clientInfo?.id || 'null'}] [TCP] Connection closed (unauthenticated) from ${clientIP}`);
-        if (!wasAuthenticated && !isTrustedPeer && !isRegionBlocked) {
+        if (!wasAuthenticated && !authAttempted && !isTrustedPeer && !isRegionBlocked) {
           const blocked = rateLimiter.recordFailure(clientIP);
           if (blocked) {
             console.log(`[RATE_LIMIT] IP ${clientIP} has been blocked`);

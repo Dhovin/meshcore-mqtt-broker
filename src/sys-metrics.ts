@@ -41,12 +41,33 @@ export interface InboundPeerRecord {
 export type DisconnectReason =
   | 'keepalive_timeout'
   | 'ws_ping_timeout'
+  | 'abnormal_close_1006'
+  | 'payload_too_big_1009'
+  | 'going_away_1001'
   | 'client_error'
   | 'packet_validation'
   | 'duplicate_client_id'
   | 'transport_close'
   | 'clean_disconnect'
   | 'unknown';
+
+const WS_CLOSE_CODE_MEANINGS: Record<number, string> = {
+  1000: '1000 Normal Closure',
+  1001: '1001 Going Away (client/tab closing or host shutdown)',
+  1002: '1002 Protocol Error',
+  1003: '1003 Unsupported Data',
+  1005: '1005 No Status Received',
+  1006: '1006 Abnormal Closure (abrupt network/proxy drop)',
+  1007: '1007 Invalid Frame Payload Data',
+  1008: '1008 Policy Violation',
+  1009: '1009 Message Too Big (>1MB maxPayload)',
+  1011: '1011 Internal Error',
+};
+
+export function describeWsCloseCode(code: number | null | undefined): string | null {
+  if (code === null || code === undefined || !Number.isFinite(code)) return null;
+  return WS_CLOSE_CODE_MEANINGS[code] || `${code} WebSocket Close`;
+}
 
 export interface DisconnectEventInfo {
   clientId?: string;
@@ -68,9 +89,12 @@ export interface ClientChurnRecord {
   publicKey: string | null;
   disconnectCount: number;
   shortSessionCount: number;
+  abnormal1006Count: number;
+  payload1009Count: number;
   lastReason: DisconnectReason;
   lastError: string | null;
   lastWsCloseCode: number | null;
+  lastWsCloseMeaning: string | null;
   lastDurationSeconds: number | null;
   lastIp: string | null;
   lastTransport: string | null;
@@ -136,6 +160,9 @@ export class SysMetricsCollector {
   private readonly disconnectsByReason: Record<DisconnectReason, number> = {
     keepalive_timeout: 0,
     ws_ping_timeout: 0,
+    abnormal_close_1006: 0,
+    payload_too_big_1009: 0,
+    going_away_1001: 0,
     client_error: 0,
     packet_validation: 0,
     duplicate_client_id: 0,
@@ -280,14 +307,21 @@ export class SysMetricsCollector {
       const now = Date.now();
       const existing = this.clientChurn.get(clientKey);
       const isShort = dur !== undefined && dur < 60;
+      const is1006 = reason === 'abnormal_close_1006' || info?.wsCloseCode === 1006;
+      const is1009 = reason === 'payload_too_big_1009' || info?.wsCloseCode === 1009;
+      const closeMeaning = describeWsCloseCode(info?.wsCloseCode ?? null);
+
       if (existing) {
         existing.disconnectCount++;
         if (isShort) existing.shortSessionCount++;
+        if (is1006) existing.abnormal1006Count++;
+        if (is1009) existing.payload1009Count++;
         existing.clientId = info?.clientId || existing.clientId;
         existing.clientType = info?.clientType || existing.clientType;
         existing.lastReason = reason;
         existing.lastError = info?.error ?? null;
         existing.lastWsCloseCode = info?.wsCloseCode ?? null;
+        existing.lastWsCloseMeaning = closeMeaning;
         existing.lastDurationSeconds = dur ?? null;
         existing.lastIp = info?.ip ?? existing.lastIp;
         existing.lastTransport = info?.transport ?? existing.lastTransport;
@@ -307,15 +341,41 @@ export class SysMetricsCollector {
           publicKey: info?.publicKey ?? null,
           disconnectCount: 1,
           shortSessionCount: isShort ? 1 : 0,
+          abnormal1006Count: is1006 ? 1 : 0,
+          payload1009Count: is1009 ? 1 : 0,
           lastReason: reason,
           lastError: info?.error ?? null,
           lastWsCloseCode: info?.wsCloseCode ?? null,
+          lastWsCloseMeaning: closeMeaning,
           lastDurationSeconds: dur ?? null,
           lastIp: info?.ip ?? null,
           lastTransport: info?.transport ?? null,
           lastDisconnectedAt: now,
         });
       }
+    }
+  }
+
+  /**
+   * Backfill a WebSocket close code when ws.on('close') fires after Aedes's clientDisconnect event.
+   */
+  public recordLateWsCloseCode(clientKey: string | undefined, wsCloseCode: number): void {
+    const codeKey = String(wsCloseCode);
+    if (this.wsCloseCodes.size < 50 || this.wsCloseCodes.has(codeKey)) {
+      this.wsCloseCodes.set(codeKey, (this.wsCloseCodes.get(codeKey) ?? 0) + 1);
+    }
+
+    if (!clientKey) return;
+    const rec = this.clientChurn.get(clientKey);
+    if (!rec) return;
+
+    rec.lastWsCloseCode = wsCloseCode;
+    rec.lastWsCloseMeaning = describeWsCloseCode(wsCloseCode);
+    if (wsCloseCode === 1006 && rec.lastReason !== 'abnormal_close_1006') {
+      rec.abnormal1006Count++;
+    }
+    if (wsCloseCode === 1009 && rec.lastReason !== 'payload_too_big_1009') {
+      rec.payload1009Count++;
     }
   }
 
@@ -1085,8 +1145,13 @@ export class SysMetricsCollector {
    */
   public getDisconnectSnapshot(nowMs: number = Date.now()) {
     const wsCloseCodes: Record<string, number> = {};
+    const wsCloseCodeMeanings: Record<string, string> = {};
     for (const [code, count] of this.wsCloseCodes.entries()) {
       wsCloseCodes[code] = count;
+      const meaning = describeWsCloseCode(Number(code));
+      if (meaning) {
+        wsCloseCodeMeanings[code] = meaning;
+      }
     }
 
     const avgDurationSeconds =
@@ -1103,9 +1168,12 @@ export class SysMetricsCollector {
         publicKey: rec.publicKey,
         disconnectCount: rec.disconnectCount,
         shortSessionCount: rec.shortSessionCount,
+        abnormal1006Count: rec.abnormal1006Count,
+        payload1009Count: rec.payload1009Count,
         lastReason: rec.lastReason,
         lastError: rec.lastError,
         lastWsCloseCode: rec.lastWsCloseCode,
+        lastWsCloseMeaning: rec.lastWsCloseMeaning,
         lastDurationSeconds: rec.lastDurationSeconds,
         lastIp: rec.lastIp,
         lastTransport: rec.lastTransport,
@@ -1119,6 +1187,7 @@ export class SysMetricsCollector {
       avgDurationSeconds,
       byReason: { ...this.disconnectsByReason },
       wsCloseCodes,
+      wsCloseCodeMeanings,
       sessionDurations: { ...this.sessionDurations },
       trackedChurnClients: this.clientChurn.size,
       topChurning,
