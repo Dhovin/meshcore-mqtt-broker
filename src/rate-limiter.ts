@@ -1,12 +1,15 @@
 /**
- * Rate limiting for failed connection attempts by IP address
- * Includes bounded memory capacity and background cleanup of expired entries
+ * Rate limiting for failed connection and authentication attempts.
+ * Separates pre-auth socket drops (IP-keyed with cooldown decay) from
+ * credential failures (IP + IP:username keyed, only decayed by same-username success)
+ * so an attacker cannot wipe admin login failures via observer/low-privilege logins.
  */
 
 interface RateLimitRecord {
   count: number;
   firstFailure: number;
   blockedUntil?: number;
+  lastDecayAt?: number;
 }
 
 export interface RateLimiterStats {
@@ -24,25 +27,30 @@ export interface RateLimiterStats {
 
 export class RateLimiter {
   private failedConnectionsByIP = new Map<string, RateLimitRecord>();
+  private authFailuresByIp = new Map<string, RateLimitRecord>();
+  private authFailuresByIpUser = new Map<string, RateLimitRecord>();
   private readonly windowMs: number;
   private readonly maxFailedConnections: number;
   private readonly blockDurationMs: number;
   private readonly maxEntries: number;
+  private readonly preAuthDecayCooldownMs: number;
   private cleanupInterval?: NodeJS.Timeout;
   private totalBlocksIssued = 0;
   private totalBlockedAttempts = 0;
 
   constructor(
-    windowMs: number = 60000,          // 1 minute
+    windowMs: number = 60000,               // 1 minute
     maxFailedConnections: number = 10,
-    blockDurationMs: number = 300000,   // 5 minutes
-    maxEntries: number = 10000,        // Bound map size to prevent memory exhaustion
-    cleanupIntervalMs: number = 300000 // Clean up expired records every 5 minutes
+    blockDurationMs: number = 300000,       // 5 minutes
+    maxEntries: number = 10000,             // Bound map size to prevent memory exhaustion
+    cleanupIntervalMs: number = 300000,     // Clean up expired records every 5 minutes
+    preAuthDecayCooldownMs: number = 10000  // Min 10s between pre-auth drop decays per IP
   ) {
     this.windowMs = windowMs;
     this.maxFailedConnections = maxFailedConnections;
     this.blockDurationMs = blockDurationMs;
     this.maxEntries = maxEntries;
+    this.preAuthDecayCooldownMs = preAuthDecayCooldownMs;
 
     if (cleanupIntervalMs > 0) {
       this.cleanupInterval = setInterval(() => {
@@ -65,109 +73,212 @@ export class RateLimiter {
     return now - rec.firstFailure > this.windowMs;
   }
 
+  private pruneMap(map: Map<string, RateLimitRecord>, now: number): void {
+    for (const [key, record] of map.entries()) {
+      if (this.isRecordExpired(record, now)) {
+        map.delete(key);
+      }
+    }
+  }
+
   /**
    * Prune expired failure and block records from memory
    */
   public cleanupExpired(): void {
     const now = Date.now();
-    for (const [ip, record] of this.failedConnectionsByIP.entries()) {
-      if (this.isRecordExpired(record, now)) {
-        this.failedConnectionsByIP.delete(ip);
-      }
-    }
+    this.pruneMap(this.failedConnectionsByIP, now);
+    this.pruneMap(this.authFailuresByIp, now);
+    this.pruneMap(this.authFailuresByIpUser, now);
   }
 
   /**
-   * Evict an entry to maintain capacity:
+   * Evict an entry from a map to maintain capacity:
    * 1. Evict expired entries first.
    * 2. Evict the oldest unblocked entry.
    * 3. Never evict active blocks to make room.
    */
-  private evictEntry(now: number): boolean {
-    // 1. Evict expired entries first
-    for (const [ip, rec] of this.failedConnectionsByIP.entries()) {
+  private evictEntryFromMap(map: Map<string, RateLimitRecord>, now: number): boolean {
+    for (const [key, rec] of map.entries()) {
       if (this.isRecordExpired(rec, now)) {
-        this.failedConnectionsByIP.delete(ip);
+        map.delete(key);
         return true;
       }
     }
 
-    // 2. Evict oldest unblocked entry
-    for (const [ip, rec] of this.failedConnectionsByIP.entries()) {
+    for (const [key, rec] of map.entries()) {
       if (!rec.blockedUntil) {
-        this.failedConnectionsByIP.delete(ip);
+        map.delete(key);
         return true;
       }
     }
 
-    // 3. Never evict active blocks to make room
     return false;
+  }
+
+  /**
+   * Increment a counter record in the given map, enforcing capacity bounds and window expiration.
+   */
+  private incrementMapRecord(
+    map: Map<string, RateLimitRecord>,
+    key: string,
+    now: number
+  ): RateLimitRecord | null {
+    const existing = map.get(key);
+
+    if (!existing) {
+      if (map.size >= this.maxEntries && !this.evictEntryFromMap(map, now)) {
+        return null;
+      }
+      const created: RateLimitRecord = { count: 1, firstFailure: now };
+      map.set(key, created);
+      return created;
+    }
+
+    if (this.isRecordExpired(existing, now)) {
+      map.delete(key);
+      const reset: RateLimitRecord = { count: 1, firstFailure: now };
+      map.set(key, reset);
+      return reset;
+    }
+
+    existing.count++;
+    // Refresh insertion order so recently active keys are kept over idle ones
+    map.delete(key);
+    map.set(key, existing);
+    return existing;
+  }
+
+  private hasActiveBlockInMap(map: Map<string, RateLimitRecord>, key: string, now: number): boolean {
+    const record = map.get(key);
+    if (!record) return false;
+
+    if (this.isRecordExpired(record, now)) {
+      map.delete(key);
+      return false;
+    }
+
+    return Boolean(record.blockedUntil && now < record.blockedUntil);
+  }
+
+  private hasActiveBlock(ip: string, now: number): boolean {
+    return (
+      this.hasActiveBlockInMap(this.failedConnectionsByIP, ip, now) ||
+      this.hasActiveBlockInMap(this.authFailuresByIp, ip, now)
+    );
+  }
+
+  private applyIpBlock(ip: string, record: RateLimitRecord, now: number, label: string): void {
+    record.blockedUntil = now + this.blockDurationMs;
+    this.totalBlocksIssued++;
+    this.totalBlockedAttempts++;
+
+    // Mirror active block into failedConnectionsByIP so getStats() reports all blocked IPs
+    const dropRec = this.failedConnectionsByIP.get(ip);
+    if (dropRec && !this.isRecordExpired(dropRec, now)) {
+      dropRec.blockedUntil = record.blockedUntil;
+      dropRec.count = Math.max(dropRec.count, record.count);
+    } else if (
+      this.failedConnectionsByIP.size < this.maxEntries ||
+      this.evictEntryFromMap(this.failedConnectionsByIP, now)
+    ) {
+      this.failedConnectionsByIP.set(ip, {
+        count: record.count,
+        firstFailure: record.firstFailure,
+        blockedUntil: record.blockedUntil,
+      });
+    }
+
+    console.log(
+      `[RATE_LIMIT] Blocking IP ${ip} for ${this.blockDurationMs / 1000}s ` +
+      `(${record.count} ${label} in ${this.windowMs / 1000}s)`
+    );
   }
 
   /**
    * Check if an IP address is currently blocked
    */
-  isBlocked(ip: string): boolean {
-    const record = this.failedConnectionsByIP.get(ip);
-    if (!record) return false;
-
-    const now = Date.now();
-    if (this.isRecordExpired(record, now)) {
-      this.failedConnectionsByIP.delete(ip);
-      return false;
-    }
-
-    const isCurrentlyBlocked = Boolean(record.blockedUntil && now < record.blockedUntil);
-    if (isCurrentlyBlocked) {
+  isBlocked(ip: string, now: number = Date.now()): boolean {
+    if (this.hasActiveBlock(ip, now)) {
       this.totalBlockedAttempts++;
+      return true;
     }
-    return isCurrentlyBlocked;
+    return false;
   }
 
   /**
-   * Record a failed connection attempt from an IP
-   * Returns true if the IP should now be blocked
+   * Apply decay on successful authentication without allowing an attacker to wipe
+   * failed password attempts for other accounts:
+   * - Pre-auth socket drops decay by 1 at most once per preAuthDecayCooldownMs.
+   * - Credential failures only decay by 1 when the exact same username authenticates.
    */
-  recordFailure(ip: string): boolean {
-    const now = Date.now();
-    const record = this.failedConnectionsByIP.get(ip);
+  recordSuccess(ip: string, username?: string, now: number = Date.now()): void {
+    if (this.hasActiveBlock(ip, now)) {
+      return;
+    }
 
-    if (!record) {
-      // Enforce max capacity to prevent memory exhaustion attacks
-      if (this.failedConnectionsByIP.size >= this.maxEntries) {
-        const evicted = this.evictEntry(now);
-        // If all entries are actively blocked, do not displace them
-        if (!evicted) {
-          return false;
+    // 1. Decay pre-auth socket drop count with cooldown
+    const dropRec = this.failedConnectionsByIP.get(ip);
+    if (dropRec && !dropRec.blockedUntil && !this.isRecordExpired(dropRec, now)) {
+      if (
+        dropRec.lastDecayAt === undefined ||
+        now - dropRec.lastDecayAt >= this.preAuthDecayCooldownMs
+      ) {
+        dropRec.count = Math.max(0, dropRec.count - 1);
+        dropRec.lastDecayAt = now;
+      }
+    }
+
+    // 2. Decay same-username credential failure count only
+    if (username) {
+      const userKey = `${ip}:${username}`;
+      const userRec = this.authFailuresByIpUser.get(userKey);
+      if (userRec && !userRec.blockedUntil && !this.isRecordExpired(userRec, now) && userRec.count > 0) {
+        userRec.count--;
+        if (userRec.count === 0) {
+          this.authFailuresByIpUser.delete(userKey);
+        }
+
+        const ipAuthRec = this.authFailuresByIp.get(ip);
+        if (ipAuthRec && !ipAuthRec.blockedUntil && !this.isRecordExpired(ipAuthRec, now)) {
+          ipAuthRec.count = Math.max(0, ipAuthRec.count - 1);
+          if (ipAuthRec.count === 0) {
+            this.authFailuresByIp.delete(ip);
+          }
         }
       }
-
-      this.failedConnectionsByIP.set(ip, { count: 1, firstFailure: now });
-      return false;
     }
+  }
 
-    // Reset if previous window or block has expired
-    if (this.isRecordExpired(record, now)) {
-      this.failedConnectionsByIP.delete(ip);
-      this.failedConnectionsByIP.set(ip, { count: 1, firstFailure: now });
-      return false;
-    }
+  /**
+   * Record a failed pre-auth socket drop from an IP.
+   * Returns true if the IP should now be blocked.
+   */
+  recordFailure(ip: string, now: number = Date.now()): boolean {
+    const record = this.incrementMapRecord(this.failedConnectionsByIP, ip, now);
+    if (!record) return false;
 
-    record.count++;
-
-    // Refresh insertion order so recently failed IPs are kept over idle ones
-    this.failedConnectionsByIP.delete(ip);
-    this.failedConnectionsByIP.set(ip, record);
-
-    // Block if threshold exceeded
     if (record.count >= this.maxFailedConnections && !record.blockedUntil) {
-      record.blockedUntil = now + this.blockDurationMs;
-      this.totalBlocksIssued++;
-      this.totalBlockedAttempts++;
-      console.log(
-        `[RATE_LIMIT] Blocking IP ${ip} for ${this.blockDurationMs / 1000}s ` +
-        `(${record.count} failed connections in ${this.windowMs / 1000}s)`
-      );
+      this.applyIpBlock(ip, record, now, 'failed connections');
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Record a failed credential authentication attempt for an IP (and optionally username).
+   * Returns true if the IP should now be blocked.
+   */
+  recordAuthFailure(ip: string, username?: string, now: number = Date.now()): boolean {
+    if (username) {
+      this.incrementMapRecord(this.authFailuresByIpUser, `${ip}:${username}`, now);
+    }
+
+    const record = this.incrementMapRecord(this.authFailuresByIp, ip, now);
+    if (!record) return false;
+
+    if (record.count >= this.maxFailedConnections && !record.blockedUntil) {
+      this.applyIpBlock(ip, record, now, 'failed auth attempts');
       return true;
     }
 
@@ -179,30 +290,45 @@ export class RateLimiter {
    */
   getStats(maxBlockedList: number = 50): RateLimiterStats {
     const now = Date.now();
-    let blockedIPCount = 0;
-    const blockedIPs: RateLimiterStats['blockedIPs'] = [];
+    this.pruneMap(this.failedConnectionsByIP, now);
+    this.pruneMap(this.authFailuresByIp, now);
+    this.pruneMap(this.authFailuresByIpUser, now);
+
+    const trackedIPs = new Set<string>();
+    const blockedByIP = new Map<string, { failures: number; blockedUntil: number }>();
 
     for (const [ip, record] of this.failedConnectionsByIP.entries()) {
-      if (this.isRecordExpired(record, now)) {
-        this.failedConnectionsByIP.delete(ip);
-        continue;
+      if (record.count > 0 || record.blockedUntil) {
+        trackedIPs.add(ip);
       }
       if (record.blockedUntil && now < record.blockedUntil) {
-        blockedIPCount++;
-        if (blockedIPs.length < maxBlockedList) {
-          blockedIPs.push({
-            ip,
-            failures: record.count,
-            blockedUntil: record.blockedUntil,
-            remainingSeconds: Math.max(0, Math.ceil((record.blockedUntil - now) / 1000)),
-          });
-        }
+        blockedByIP.set(ip, { failures: record.count, blockedUntil: record.blockedUntil });
       }
     }
 
+    for (const [ip, record] of this.authFailuresByIp.entries()) {
+      if (record.count > 0 || record.blockedUntil) {
+        trackedIPs.add(ip);
+      }
+      if (record.blockedUntil && now < record.blockedUntil && !blockedByIP.has(ip)) {
+        blockedByIP.set(ip, { failures: record.count, blockedUntil: record.blockedUntil });
+      }
+    }
+
+    const blockedIPs: RateLimiterStats['blockedIPs'] = [];
+    for (const [ip, info] of blockedByIP.entries()) {
+      if (blockedIPs.length >= maxBlockedList) break;
+      blockedIPs.push({
+        ip,
+        failures: info.failures,
+        blockedUntil: info.blockedUntil,
+        remainingSeconds: Math.max(0, Math.ceil((info.blockedUntil - now) / 1000)),
+      });
+    }
+
     return {
-      trackedIPCount: this.failedConnectionsByIP.size,
-      blockedIPCount,
+      trackedIPCount: trackedIPs.size,
+      blockedIPCount: blockedByIP.size,
       totalBlocksIssued: this.totalBlocksIssued,
       totalBlockedAttempts: this.totalBlockedAttempts,
       blockedIPs,
@@ -225,6 +351,8 @@ export class RateLimiter {
       this.cleanupInterval = undefined;
     }
     this.failedConnectionsByIP.clear();
+    this.authFailuresByIp.clear();
+    this.authFailuresByIpUser.clear();
     this.totalBlocksIssued = 0;
     this.totalBlockedAttempts = 0;
   }

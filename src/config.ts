@@ -19,6 +19,13 @@ function validateRequiredEnvVars(vars: string[]): void {
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+function parseNonNegativeIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return defaultValue;
+  const parsed = parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
+}
+
 // Validate and load MQTT configuration
 export function loadMqttConfig() {
   validateRequiredEnvVars([
@@ -52,6 +59,25 @@ export function loadMqttConfig() {
     console.log(`[CONFIG] Allowed ingestion regions (${allowedRegions.size}): ${Array.from(allowedRegions).join(', ')}`);
   }
 
+  const rawConnectTimeoutMs = parseNonNegativeIntEnv('MQTT_CONNECT_TIMEOUT_MS', 30000);
+  const connectTimeoutMs = rawConnectTimeoutMs < 5000 ? 5000 : rawConnectTimeoutMs;
+  if (rawConnectTimeoutMs < 5000 && process.env.MQTT_CONNECT_TIMEOUT_MS !== undefined) {
+    console.warn(`[CONFIG] Warning: MQTT_CONNECT_TIMEOUT_MS (${rawConnectTimeoutMs}) is below minimum 5000ms; clamping to 5000ms`);
+  }
+
+  const wsPingIntervalMs = parseNonNegativeIntEnv('MQTT_WS_PING_INTERVAL_MS', 30000);
+  let wsPingTimeoutMs = parseNonNegativeIntEnv('MQTT_WS_PING_TIMEOUT_MS', 90000);
+  if (wsPingIntervalMs > 0 && wsPingTimeoutMs > 0 && wsPingTimeoutMs <= wsPingIntervalMs) {
+    const adjusted = wsPingIntervalMs * 3;
+    console.warn(
+      `[CONFIG] Warning: MQTT_WS_PING_TIMEOUT_MS (${wsPingTimeoutMs}) must be greater than MQTT_WS_PING_INTERVAL_MS (${wsPingIntervalMs}); adjusting to ${adjusted}ms`
+    );
+    wsPingTimeoutMs = adjusted;
+  }
+
+  const rawMaxUnauth = parseNonNegativeIntEnv('MQTT_MAX_UNAUTH_CONNECTIONS_PER_IP', 100);
+  const maxUnauthConnectionsPerIp = rawMaxUnauth < 1 ? 100 : rawMaxUnauth;
+
   return {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),
     tcpPort: parseInt(process.env.MQTT_TCP_PORT || '1883', 10),
@@ -61,6 +87,11 @@ export function loadMqttConfig() {
     httpRedirectUrl: process.env.HTTP_REDIRECT_URL ? process.env.HTTP_REDIRECT_URL.trim() : '',
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
     sysIntervalMs: parseInt(process.env.MQTT_SYS_INTERVAL_MS || '10000', 10),
+    connectTimeoutMs,
+    wsPingIntervalMs,
+    wsPingTimeoutMs,
+    tcpKeepaliveMs: parseNonNegativeIntEnv('MQTT_TCP_KEEPALIVE_MS', 30000),
+    maxUnauthConnectionsPerIp,
     logLevel,
     allowedRegions,
   };
