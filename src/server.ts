@@ -20,12 +20,12 @@ import { loadOrCreatePeerIdentity, PeerKeyPair } from './peer-crypto.js';
 import { ObserverRegionBlocklist, isRegionAllowed } from './region-filter.js';
 
 // Read broker version from package.json
-let brokerVersion = '1.1.0';
+let brokerVersion = '1.1.1';
 try {
   const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
   if (pkg.version) brokerVersion = pkg.version;
 } catch {
-  // Fallback to 1.1.0 if package.json cannot be read
+  // Fallback to 1.1.1 if package.json cannot be read
 }
 
 // Load and validate configuration
