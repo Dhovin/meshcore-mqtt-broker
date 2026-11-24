@@ -6,7 +6,7 @@ import { Duplex } from 'stream';
 import { readFileSync } from 'fs';
 import { dirname } from 'path';
 import { createHash } from 'crypto';
-import { verifyAuthToken } from '@michaelhart/meshcore-decoder';
+import { verifyAuthToken, decodeAuthTokenPayload } from '@michaelhart/meshcore-decoder';
 import { getAirportInfo } from 'airport-utils';
 import { RateLimiter } from './rate-limiter.js';
 import { getClientIP } from './ip-utils.js';
@@ -42,6 +42,7 @@ const HOST = mqttConfig.host;
 const EXPECTED_AUDIENCE = mqttConfig.expectedAudience;
 const HTTP_REDIRECT_URL = mqttConfig.httpRedirectUrl;
 const ALLOWED_REGIONS = mqttConfig.allowedRegions;
+const LWT_GRACE_MS = mqttConfig.lwtGraceMs;
 
 // Always initialize the broker's Ed25519 peer identity on startup (persisted in /data/peer-identity.json)
 // so its public key is immediately visible in the startup banner and $SYS telemetry.
@@ -235,6 +236,168 @@ function suppressWill(client: any): void {
   }
   client.will = null;
   client._will = null;
+}
+
+// Clear a displaced same-key publisher's in-memory will at exact registration time (after storeWill
+// has already persisted the replacement client's will, and only when the replacement is not closed).
+// Do NOT call persistence.delWill here, or it would erase the replacement client's newly persisted will.
+const originalRegisterClient = (aedes as any).registerClient.bind(aedes);
+(aedes as any).registerClient = (client: any) => {
+  if (
+    client &&
+    !client.closed &&
+    client.clientType === ClientType.PUBLISHER &&
+    client.publicKey
+  ) {
+    const existingClient = (aedes as any).clients?.[client.id];
+    if (
+      existingClient &&
+      existingClient !== client &&
+      existingClient.clientType === ClientType.PUBLISHER &&
+      existingClient.publicKey === client.publicKey
+    ) {
+      if (isDebug) {
+        console.log(
+          `${getClientLogPrefix(client)} [LWT] Suppressing will on displaced session takeover (clientId: ${client.id})`
+        );
+      }
+      existingClient.will = null;
+      existingClient._will = null;
+    }
+  }
+  return originalRegisterClient(client);
+};
+
+// Track active Publisher clients per uppercase publicKey (for LWT reconnect suppression)
+const activePublishersByKey = new Map<string, Set<any>>();
+
+interface PendingPublisherWill {
+  timer: NodeJS.Timeout;
+  topic: string;
+  qos: 0 | 1;
+  message: any;
+  payloadBuf: Buffer;
+  client: any;
+  scheduledAt: number;
+}
+const pendingPublisherWills = new Map<string, PendingPublisherWill>();
+
+// Track last seen status timestamp per origin_id to prevent race conditions (bounded to 10,000 origins)
+const lastStatusTimestamps = new Map<string, number>();
+const MAX_STATUS_ORIGINS = 10_000;
+const MAX_FUTURE_STATUS_SKEW_MS = 60_000;
+const MAX_TOPIC_LENGTH = 256;
+const ZONELESS_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
+const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+
+function formatTopicForLog(topic: string): string {
+  return topic.length > 128 ? `${topic.slice(0, 128)}... (${topic.length}B)` : topic;
+}
+
+function recordLastStatusTimestamp(originId: string, effectiveTimestamp: number): void {
+  if (!originId || !effectiveTimestamp || isNaN(effectiveTimestamp)) return;
+  const existing = lastStatusTimestamps.get(originId) || 0;
+  if (effectiveTimestamp <= existing) return;
+  if (!lastStatusTimestamps.has(originId) && lastStatusTimestamps.size >= MAX_STATUS_ORIGINS) {
+    const oldestKey = lastStatusTimestamps.keys().next().value;
+    if (oldestKey) lastStatusTimestamps.delete(oldestKey);
+  }
+  lastStatusTimestamps.set(originId, effectiveTimestamp);
+}
+
+function parseStatusTimestampMs(rawTs: unknown, nowMs: number = Date.now()): number {
+  if (typeof rawTs === 'number') {
+    return Number.isFinite(rawTs) ? rawTs : 0;
+  }
+  if (typeof rawTs !== 'string') {
+    return 0;
+  }
+  const trimmed = rawTs.trim();
+  if (!trimmed) {
+    return 0;
+  }
+  if (ZONELESS_ISO_RE.test(trimmed)) {
+    const utcMs = Date.parse(`${trimmed}Z`);
+    if (isNaN(utcMs)) return 0;
+    const diffMs = utcMs - nowMs;
+    // Infer non-UTC localtime_r offsets (e.g., OffbandMesh TZ=Asia/Tokyo +9h or PST -8h):
+    // Only adjust offsets >= 1h (|quarters| >= 4) within IANA range [-12h, +14h]
+    // whose residual from a 15-minute timezone boundary is within MAX_FUTURE_STATUS_SKEW_MS.
+    const offsetQuarters = Math.round(diffMs / FIFTEEN_MINUTES_MS);
+    if (
+      Math.abs(offsetQuarters) >= 4 &&
+      offsetQuarters >= -48 &&
+      offsetQuarters <= 56 &&
+      Math.abs(diffMs - offsetQuarters * FIFTEEN_MINUTES_MS) <= MAX_FUTURE_STATUS_SKEW_MS
+    ) {
+      return utcMs - offsetQuarters * FIFTEEN_MINUTES_MS;
+    }
+    return utcMs;
+  }
+  const parsed = new Date(trimmed).getTime();
+  return isNaN(parsed) ? 0 : parsed;
+}
+
+function refreshLwtPayloadIfStale(
+  message: any,
+  originKey: string,
+  originalPayload: Buffer,
+  client: any
+): Buffer | null {
+  const globalLastTs = lastStatusTimestamps.get(originKey) || 0;
+  const ownLastTs = (client as any)?.lastOwnStatusTs || 0;
+  const now = Date.now();
+  const rawWillTs =
+    message && typeof message === 'object' && message.timestamp !== undefined
+      ? parseStatusTimestampMs(message.timestamp, now)
+      : 0;
+  const clampedWillTs = rawWillTs > 0 ? Math.min(rawWillTs, now + MAX_FUTURE_STATUS_SKEW_MS) : 0;
+  const effectiveOwnTs = Math.max(ownLastTs, clampedWillTs);
+
+  // If a newer status arrived from another session or peered broker, drop this stale will
+  if (globalLastTs > effectiveOwnTs) {
+    return null;
+  }
+
+  // Advance CONNECT-time LWT only up to this dying session's own last status timestamp
+  if (ownLastTs > 0 && rawWillTs > 0 && rawWillTs < ownLastTs) {
+    const updatedMessage = { ...message, timestamp: new Date(ownLastTs).toISOString() };
+    const updatedBuf = Buffer.from(JSON.stringify(updatedMessage), 'utf-8');
+    parsedPayloadCache.set(updatedBuf, updatedMessage);
+    return updatedBuf;
+  }
+  return originalPayload;
+}
+
+function denyAndClosePublisher(
+  client: any,
+  packet: any,
+  isWillPacket: boolean,
+  logPrefix: string,
+  reasonTag: string,
+  disconnectReason: string,
+  errMessage: string,
+  callback: (err?: Error | null) => void,
+  blockIata?: string
+): void {
+  const safeTopic = formatTopicForLog(packet.topic);
+  if (isWillPacket) {
+    console.log(`${logPrefix} [AUTHZ] ✗ Will denied -> ${safeTopic} (${reasonTag})`);
+    sysMetrics.recordUnauthorizedPublish();
+    callback(new Error(errMessage));
+    return;
+  }
+  console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${safeTopic} (${reasonTag})`);
+  console.log(`${logPrefix} [DISCONNECT] Closing client - ${disconnectReason}`);
+  if (blockIata && client.publicKey) {
+    observerRegionBlocklist.block(client.publicKey.toUpperCase(), blockIata);
+  }
+  suppressWill(client);
+  packet.topic = '$drop';
+  packet.retain = false;
+  sysMetrics.recordUnauthorizedPublish();
+  callback(new Error(errMessage));
+  client.close();
 }
 
 // Inbound peer rate limiting (token bucket per authenticated peer identity)
@@ -543,7 +706,26 @@ aedes.authenticate = async (client, username, password, callback) => {
     const tokenPayload = await verifyAuthToken(passwordStr, publicKey);
 
     if (!tokenPayload) {
-      console.log(`${logPrefix} [AUTH] ✗ Invalid token signature for public key: ${publicKey.substring(0, 8)}...`);
+      const unverifiedPayload = decodeAuthTokenPayload(passwordStr);
+      const shortKey = publicKey.substring(0, 8);
+      if (!unverifiedPayload) {
+        console.log(`${logPrefix} [AUTH] ✗ Malformed auth token for public key: ${shortKey}...`);
+      } else if (
+        typeof unverifiedPayload.publicKey === 'string' &&
+        unverifiedPayload.publicKey.toUpperCase() !== publicKey
+      ) {
+        console.log(`${logPrefix} [AUTH] ✗ Token public key mismatch for ${shortKey}...`);
+      } else if (
+        typeof unverifiedPayload.exp === 'number' &&
+        Math.floor(Date.now() / 1000) > unverifiedPayload.exp
+      ) {
+        const expiredAgoSec = Math.floor(Date.now() / 1000) - unverifiedPayload.exp;
+        console.log(
+          `${logPrefix} [AUTH] ✗ Expired auth token for public key: ${shortKey}... (expired ${expiredAgoSec}s ago, exp: ${new Date(unverifiedPayload.exp * 1000).toISOString()})`
+        );
+      } else {
+        console.log(`${logPrefix} [AUTH] ✗ Invalid token signature for public key: ${shortKey}...`);
+      }
       sysMetrics.recordAuthFailure();
       callback(null, false);
       return;
@@ -602,7 +784,7 @@ aedes.authenticate = async (client, username, password, callback) => {
       stream.authenticated = true;
       stream.client = client;
     }
-    
+
     // Initialize abuse detection tracking
     const clientIP = stream?.clientIP;
     abuseDetector.initializeClient(publicKey, `v1_${publicKey}`, clientIP);
@@ -620,6 +802,7 @@ aedes.authenticate = async (client, username, password, callback) => {
 // loop always finishes resetting parser state before Aedes invokes client._nextBatch(),
 // even when zero subscribers are connected.
 aedes.authorizePublish = (client, packet, rawCallback) => {
+  const isWillPacket = Boolean(client && (client as any).will && packet === (client as any).will);
   const callback = (err?: Error | null) => {
     process.nextTick(rawCallback, err ?? null);
   };
@@ -634,17 +817,49 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
   // Enforce maximum packet payload size to prevent event loop freezes and memory exhaustion
   if (packet.payload && packet.payload.length > mqttConfig.maxPacketBytes) {
-    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${formatTopicForLog(packet.topic)} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
     sysMetrics.recordUnauthorizedPublish();
     callback(new Error(`Payload size exceeds maximum allowed size of ${mqttConfig.maxPacketBytes} bytes`));
     return;
   }
+
+  // Enforce maximum topic length before parsing segments or storing/logging topic strings
+  if (packet.topic && packet.topic.length > MAX_TOPIC_LENGTH) {
+    const safeTopic = formatTopicForLog(packet.topic);
+    if (clientType === ClientType.PEER) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${safeTopic} (topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+      }
+      sysMetrics.recordUnauthorizedPublish();
+      sysMetrics.recordInboundPeerInvalid(client);
+      dropPacketSilently(packet, callback);
+      return;
+    }
+    if (clientType === ClientType.PUBLISHER) {
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        `topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B`,
+        `Topic exceeds maximum length (${MAX_TOPIC_LENGTH}B)`,
+        `Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`,
+        callback,
+        'INVALID'
+      );
+      return;
+    }
+    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${safeTopic} (topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+    sysMetrics.recordUnauthorizedPublish();
+    callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
+    return;
+  }
   
-  // Important: Strip retain flag from /status messages to prevent stale data on ingestor restart
-  // LWT (offline) messages are also STATUS messages and should NOT be retained
-  if (packet.topic.endsWith('/status') && packet.retain) {
+  // Strip retain flag from all publisher and peer telemetry subtopics so snapshots never
+  // linger in Aedes persistence while keeping Admin (role 1) deletes and bridge state intact
+  if (packet.retain && (clientType === ClientType.PUBLISHER || clientType === ClientType.PEER)) {
     if (isDebug) {
-      console.log(`${logPrefix} [AUTHZ] Stripping retain flag from STATUS message -> ${packet.topic}`);
+      console.log(`${logPrefix} [AUTHZ] Stripping retain flag -> ${packet.topic}`);
     }
     packet.retain = false;
   }
@@ -746,6 +961,18 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
     packet.topic = validation.normalizedTopic!;
     const subtopic = validation.subtopic!;
+    if (validation.enrichedPayload) {
+      if (validation.enrichedPayload.length > mqttConfig.maxPacketBytes) {
+        if (isDebug) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (enriched payload exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+        }
+        sysMetrics.recordUnauthorizedPublish();
+        sysMetrics.recordInboundPeerInvalid(client);
+        dropPacketSilently(packet, callback);
+        return;
+      }
+      packet.payload = validation.enrichedPayload;
+    }
     const payloadBuf = ensureBuffer(packet.payload);
 
     // Deduplicate cross-path packets (e.g., dual-connected observers or multi-hop topologies)
@@ -787,6 +1014,17 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
           return;
         }
       }
+
+      // Advance lastStatusTimestamps immediately on authorized peer /status publishes so even
+      // a broker with 0 local subscribers detects failover to another broker before firing stale LWTs
+      if (subtopic === 'status' && validation.parsedMessage.timestamp !== undefined) {
+        const peerStatusNow = Date.now();
+        const peerRawTs = parseStatusTimestampMs(validation.parsedMessage.timestamp, peerStatusNow);
+        if (peerRawTs > 0) {
+          const peerEffectiveTs = Math.min(peerRawTs, peerStatusNow + MAX_FUTURE_STATUS_SKEW_MS);
+          recordLastStatusTimestamp(originKey, peerEffectiveTs);
+        }
+      }
     }
 
     sysMetrics.recordInboundPeerPublish(client, subtopic, payloadBuf.length);
@@ -822,11 +1060,17 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     
     // Reject XXX explicitly (default placeholder value)
     if (locationCode === 'XXX') {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (XXX not valid, configure actual IATA)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location code: XXX`);
-      sysMetrics.recordUnauthorizedPublish();
-      callback(new Error('XXX is a placeholder - please configure your actual IATA location code'));
-      client.close();
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        'XXX not valid, configure actual IATA',
+        'Invalid location code: XXX',
+        'XXX is a placeholder - please configure your actual IATA location code',
+        callback,
+        'XXX'
+      );
       return;
     }
     
@@ -836,26 +1080,34 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     if (!isTestRegion) {
       // First check format (must be 3 uppercase letters, no normalization)
       if (!iataRegex.test(locationCode)) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid format)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid location format: "${locationCode}"`);
-        sysMetrics.recordUnauthorizedPublish();
-        callback(new Error('Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"'));
-        client.close();
+        const safeLoc = locationCode.length > 32 ? `${locationCode.slice(0, 32)}...` : locationCode;
+        denyAndClosePublisher(
+          client,
+          packet,
+          isWillPacket,
+          logPrefix,
+          'invalid format',
+          `Invalid location format: "${safeLoc}"`,
+          'Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"',
+          callback,
+          'INVALID'
+        );
         return;
       }
       
       // Then check if it's a valid IATA code (or explicitly permitted in ALLOWED_REGIONS)
       if (!ALLOWED_REGIONS?.has(locationCode.toUpperCase()) && !isValidIATACode(locationCode)) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid IATA)`);
-        console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid IATA code: "${locationCode}"`);
-        // A will being published means the client is already closing; deny it without blocking the key
-        if (ALLOWED_REGIONS && (client as any).publicKey && packet !== (client as any).will) {
-          observerRegionBlocklist.block((client as any).publicKey.toUpperCase(), locationCode);
-          suppressWill(client);
-        }
-        sysMetrics.recordUnauthorizedPublish();
-        callback(new Error('Location must be a valid IATA international airport code or "test"'));
-        client.close();
+        denyAndClosePublisher(
+          client,
+          packet,
+          isWillPacket,
+          logPrefix,
+          'invalid IATA',
+          `Invalid IATA code: "${locationCode}"`,
+          'Location must be a valid IATA international airport code or "test"',
+          callback,
+          locationCode
+        );
         return;
       }
     }
@@ -865,22 +1117,32 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     
     // Validate it looks like a public key (64 hex chars)
     if (!/^[0-9A-F]{64}$/i.test(topicPublicKey)) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (invalid pubkey format)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Invalid public key format in topic`);
-      sysMetrics.recordUnauthorizedPublish();
-      callback(new Error('Public key in topic must be 64 hex characters'));
-      client.close();
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        'invalid pubkey format',
+        'Invalid public key format in topic',
+        'Public key in topic must be 64 hex characters',
+        callback
+      );
       return;
     }
     
     // Validate topic public key matches authenticated client
     const clientPublicKey = (client as any).publicKey.toUpperCase();
     if (topicPublicKey !== clientPublicKey) {
-      console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (pubkey mismatch)`);
-      console.log(`${logPrefix} [DISCONNECT] Closing client - Public key mismatch`);
-      sysMetrics.recordUnauthorizedPublish();
-      callback(new Error('Public key in topic must match authenticated public key'));
-      client.close();
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        'pubkey mismatch',
+        'Public key mismatch',
+        'Public key in topic must match authenticated public key',
+        callback
+      );
       return;
     }
 
@@ -889,28 +1151,17 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     // Enforce ALLOWED_REGIONS for Observer connections:
     // Immediately drop the packet, block the Observer's public key for 1 minute, and terminate the session.
     if (!isRegionAllowed(normalizedLocation, ALLOWED_REGIONS)) {
-      // A will being published means the client is already closing; deny it without blocking the key
-      if (packet === (client as any).will) {
-        console.log(
-          `${logPrefix} [AUTHZ] ✗ Will denied -> ${packet.topic} (unapproved IATA region: "${normalizedLocation}")`
-        );
-        sysMetrics.recordUnauthorizedPublish();
-        callback(new Error(`IATA region "${normalizedLocation}" is not permitted on this broker`));
-        return;
-      }
-      console.log(
-        `${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (unapproved IATA region: "${normalizedLocation}")`
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        `unapproved IATA region: "${normalizedLocation}"`,
+        `Unapproved IATA region: "${normalizedLocation}" (blocking observer for 60s)`,
+        `IATA region "${normalizedLocation}" is not permitted on this broker`,
+        callback,
+        normalizedLocation
       );
-      console.log(
-        `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${normalizedLocation}"`
-      );
-      observerRegionBlocklist.block(clientPublicKey, normalizedLocation);
-      suppressWill(client);
-      packet.topic = '$drop';
-      packet.retain = false;
-      sysMetrics.recordUnauthorizedPublish();
-      callback(new Error(`IATA region "${normalizedLocation}" is not permitted on this broker`));
-      client.close();
       return;
     }
 
@@ -971,27 +1222,52 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
       return;
     }
 
-    // Validate that the message contains origin_id matching the authenticated public key
+    // Validate that the message is a JSON object and origin_id matches the authenticated public key
     try {
-      const message = getParsedJson(packet.payload);
+      let message = getParsedJson(packet.payload);
+      if (!message || typeof message !== 'object' || Array.isArray(message)) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload must be a JSON object)`);
+        sysMetrics.recordUnauthorizedPublish();
+        callback(new Error('Message must be a JSON object'));
+        return;
+      }
+
+      if (subtopic === 'packets' && (message.origin_id === undefined || message.origin_id === '')) {
+        // OffbandMesh #727 sec4 omits origin_id on /packets; bind from verified topic/session pubkey
+        const enrichedMessage = { ...message, origin_id: clientPublicKey };
+        const enrichedBuf = Buffer.from(JSON.stringify(enrichedMessage), 'utf-8');
+        if (enrichedBuf.length > mqttConfig.maxPacketBytes) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (enriched payload exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+          sysMetrics.recordUnauthorizedPublish();
+          callback(new Error(`Payload size exceeds maximum allowed size of ${mqttConfig.maxPacketBytes} bytes`));
+          return;
+        }
+        packet.payload = enrichedBuf;
+        parsedPayloadCache.set(enrichedBuf, enrichedMessage);
+        message = enrichedMessage;
+        if (isDebug) {
+          console.log(`${logPrefix} [AUTHZ] Populated missing origin_id on /packets from authenticated pubkey`);
+        }
+      } else {
+        if (typeof message.origin_id !== 'string' || !message.origin_id.trim()) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
+          sysMetrics.recordUnauthorizedPublish();
+          callback(new Error('Message must contain origin_id field'));
+          return;
+        }
+
+        const messageOriginId = message.origin_id.trim().toUpperCase();
+        const normalizedClientKey = clientPublicKey.toUpperCase();
+
+        if (messageOriginId !== normalizedClientKey) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (origin_id mismatch)`);
+          sysMetrics.recordUnauthorizedPublish();
+          callback(new Error('origin_id must match authenticated public key'));
+          return;
+        }
+      }
+
       (packet as any)._parsedJson = message;
-      
-      if (!message || typeof message.origin_id !== 'string' || !message.origin_id) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (missing origin_id)`);
-        sysMetrics.recordUnauthorizedPublish();
-        callback(new Error('Message must contain origin_id field'));
-        return;
-      }
-      
-      const messageOriginId = message.origin_id.toUpperCase();
-      const normalizedClientKey = clientPublicKey.toUpperCase();
-      
-      if (messageOriginId !== normalizedClientKey) {
-        console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (origin_id mismatch)`);
-        sysMetrics.recordUnauthorizedPublish();
-        callback(new Error('origin_id must match authenticated public key'));
-        return;
-      }
 
       // Track with abuse detector and enforce 4-hour temporary mute timeout if enabled
       const trustState = abuseDetector.getClientStats(clientPublicKey);
@@ -1041,6 +1317,121 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         dropPacketSilently(packet, callback);
         return;
       }
+
+      // Handle terminating LWT /status publishes: defer across grace window so rapid reconnects
+      // cancel spurious "offline" flickers, and advance stale CONNECT-time timestamps to >= lastTs
+      if (isWillPacket && subtopic === 'status') {
+        const willTopic = packet.topic;
+        const willQos: 0 | 1 = packet.qos === 1 ? 1 : 0;
+        const originalPayloadBuf = ensureBuffer(packet.payload);
+
+        if (LWT_GRACE_MS > 0) {
+          const existingPending = pendingPublisherWills.get(clientPublicKey);
+          if (existingPending) {
+            clearTimeout(existingPending.timer);
+          }
+
+          const timer = setTimeout(() => {
+            pendingPublisherWills.delete(clientPublicKey);
+            if (isShuttingDown) {
+              return;
+            }
+            const activeSet = activePublishersByKey.get(clientPublicKey);
+            if (activeSet && activeSet.size > 0) {
+              if (isDebug) {
+                console.log(`${logPrefix} [LWT] Skipping deferred LWT (publisher already online)`);
+              }
+              return;
+            }
+            const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf, client);
+            if (!refreshedBuf) {
+              if (isDebug) {
+                console.log(`${logPrefix} [LWT] Dropping stale deferred LWT (newer status received from another session or peer)`);
+              }
+              sysMetrics.recordStaleStatusFiltered();
+              return;
+            }
+            (aedes as any).publish(
+              {
+                cmd: 'publish',
+                topic: willTopic,
+                payload: refreshedBuf,
+                qos: willQos,
+                dup: false,
+                retain: false,
+              },
+              client,
+              (err: any) => {
+                if (err) {
+                  console.error(`${logPrefix} [LWT] Failed to publish deferred LWT:`, err);
+                }
+              }
+            );
+          }, LWT_GRACE_MS);
+
+          if (timer.unref) {
+            timer.unref();
+          }
+
+          pendingPublisherWills.set(clientPublicKey, {
+            timer,
+            topic: willTopic,
+            qos: willQos,
+            message,
+            payloadBuf: originalPayloadBuf,
+            client,
+            scheduledAt: Date.now(),
+          });
+
+          if (isDebug) {
+            console.log(`${logPrefix} [LWT] Deferred LWT publish for ${LWT_GRACE_MS}ms -> ${willTopic}`);
+          }
+          dropPacketSilently(packet, callback);
+          return;
+        }
+
+        // LWT_GRACE_MS === 0: suppress if another session for this observer is already active
+        const activeSet = activePublishersByKey.get(clientPublicKey);
+        if (activeSet) {
+          for (const activeClient of activeSet) {
+            if (activeClient !== client) {
+              if (isDebug) {
+                console.log(`${logPrefix} [LWT] Suppressing LWT (another session already active)`);
+              }
+              dropPacketSilently(packet, callback);
+              return;
+            }
+          }
+        }
+
+        const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf, client);
+        if (!refreshedBuf) {
+          if (isDebug) {
+            console.log(`${logPrefix} [LWT] Dropping stale LWT (newer status received from another session or peer)`);
+          }
+          sysMetrics.recordStaleStatusFiltered();
+          dropPacketSilently(packet, callback);
+          return;
+        }
+        if (refreshedBuf !== originalPayloadBuf) {
+          packet.payload = refreshedBuf;
+          (packet as any)._parsedJson = getParsedJson(refreshedBuf);
+        }
+        if (isDebug) {
+          console.log(`${logPrefix} [AUTHZ] ✓ LWT publish authorized -> ${packet.topic}`);
+        }
+        callback(null);
+        return;
+      }
+
+      if (subtopic === 'status' && message.timestamp !== undefined) {
+        const nowMs = Date.now();
+        const ownRawTs = parseStatusTimestampMs(message.timestamp, nowMs);
+        if (ownRawTs > 0) {
+          const ownEffectiveTs = Math.min(ownRawTs, nowMs + MAX_FUTURE_STATUS_SKEW_MS);
+          (client as any).lastOwnStatusTs = Math.max((client as any).lastOwnStatusTs || 0, ownEffectiveTs);
+        }
+      }
       
       if (isDebug) {
         console.log(`${logPrefix} [AUTHZ] ✓ Publish authorized -> ${packet.topic}`);
@@ -1086,6 +1477,24 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   const logPrefix = getClientLogPrefix(client);
   const clientType = (client as any).clientType;
 
+  // Enforce maximum topic length before parsing segments or storing/logging topic strings
+  if (subscription.topic && subscription.topic.length > MAX_TOPIC_LENGTH) {
+    const safeTopic = formatTopicForLog(subscription.topic);
+    console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${safeTopic} (topic length ${subscription.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+    if (clientType === ClientType.PUBLISHER) {
+      const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
+      if (clientPublicKey) {
+        observerRegionBlocklist.block(clientPublicKey, 'INVALID');
+      }
+      suppressWill(client);
+      callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
+      client.close();
+      return;
+    }
+    callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
+    return;
+  }
+
   // Peer clients are publish-only
   if (clientType === ClientType.PEER) {
     console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (peer) -> ${subscription.topic}`);
@@ -1102,16 +1511,35 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
         const topicPublicKey = parts[2].toUpperCase();
         const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
-          if (!isRegionAllowed(iata, ALLOWED_REGIONS)) {
-            console.log(
-              `${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unapproved IATA region: "${iata}")`
-            );
-            console.log(
-              `${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - Unapproved IATA region: "${iata}"`
-            );
-            observerRegionBlocklist.block(clientPublicKey, iata);
+          const isTestRegion = iata.toLowerCase() === 'test';
+          const normalizedIata = isTestRegion ? 'test' : iata.toUpperCase();
+          const safeIata = iata.length > 32 ? `${iata.slice(0, 32)}...` : iata;
+          let badReason: string | null = null;
+          let errMessage = '';
+          let blockCode = normalizedIata;
+
+          if (iata === 'XXX') {
+            badReason = 'XXX is a placeholder location code';
+            errMessage = 'XXX is a placeholder - please configure your actual IATA location code';
+            blockCode = 'XXX';
+          } else if (!isTestRegion && !/^[A-Z]{3}$/.test(iata)) {
+            badReason = `Invalid location format: "${safeIata}"`;
+            errMessage = 'Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"';
+            blockCode = 'INVALID';
+          } else if (!isTestRegion && !ALLOWED_REGIONS?.has(normalizedIata) && !isValidIATACode(iata)) {
+            badReason = `Invalid IATA code: "${iata}"`;
+            errMessage = 'Location must be a valid IATA international airport code or "test"';
+          } else if (!isRegionAllowed(normalizedIata, ALLOWED_REGIONS)) {
+            badReason = `Unapproved IATA region: "${normalizedIata}"`;
+            errMessage = `IATA region "${normalizedIata}" is not permitted on this broker`;
+          }
+
+          if (badReason) {
+            console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${formatTopicForLog(subscription.topic)} (${badReason})`);
+            console.log(`${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - ${badReason}`);
+            observerRegionBlocklist.block(clientPublicKey, blockCode);
             suppressWill(client);
-            callback(new Error(`IATA region "${iata}" is not permitted on this broker`));
+            callback(new Error(errMessage));
             client.close();
             return;
           }
@@ -1123,6 +1551,7 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
     }
     console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (publisher) -> ${subscription.topic}`);
     console.log(`${logPrefix} [DISCONNECT] Closing client - Publishers cannot subscribe`);
+    suppressWill(client);
     callback(new Error('Publisher clients are publish-only'));
     client.close();
     return;
@@ -1139,11 +1568,6 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (unknown client type)`);
   callback(new Error('Unknown client type'));
 };
-
-// Track last seen status timestamp per origin_id to prevent race conditions (bounded to 10,000 origins)
-const lastStatusTimestamps = new Map<string, number>();
-const MAX_STATUS_ORIGINS = 10_000;
-const MAX_FUTURE_STATUS_SKEW_MS = 60_000;
 
 // Authorization handler for forwarding messages to subscribers (filter sensitive data)
 aedes.authorizeForward = (client, packet) => {
@@ -1183,12 +1607,13 @@ aedes.authorizeForward = (client, packet) => {
   if (packet.topic.endsWith('/status') && packet.payload && packet.payload.length > 0) {
     try {
       const message = getParsedJson(packet.payload);
-      const originId = message?.origin_id;
-      const rawTimestamp = message?.timestamp ? new Date(message.timestamp).getTime() : 0;
+      const originId = typeof message?.origin_id === 'string' ? message.origin_id.trim().toUpperCase() : '';
+      const now = Date.now();
+      const rawTimestamp = message?.timestamp !== undefined ? parseStatusTimestampMs(message.timestamp, now) : 0;
       
       if (originId && rawTimestamp && !isNaN(rawTimestamp)) {
         // Clamp future timestamps to prevent future-timestamp poisoning DoS
-        const effectiveTimestamp = Math.min(rawTimestamp, Date.now() + MAX_FUTURE_STATUS_SKEW_MS);
+        const effectiveTimestamp = Math.min(rawTimestamp, now + MAX_FUTURE_STATUS_SKEW_MS);
         const lastTimestamp = lastStatusTimestamps.get(originId) || 0;
         
         if (effectiveTimestamp < lastTimestamp) {
@@ -1198,12 +1623,8 @@ aedes.authorizeForward = (client, packet) => {
           sysMetrics.recordStaleStatusFiltered();
           return null;
         }
-        
-        if (!lastStatusTimestamps.has(originId) && lastStatusTimestamps.size >= MAX_STATUS_ORIGINS) {
-          const oldestKey = lastStatusTimestamps.keys().next().value;
-          if (oldestKey) lastStatusTimestamps.delete(oldestKey);
-        }
-        lastStatusTimestamps.set(originId, effectiveTimestamp);
+
+        recordLastStatusTimestamp(originId, effectiveTimestamp);
       }
     } catch (error) {
       if (isDebug) {
@@ -1284,6 +1705,28 @@ aedes.on('client', (client) => {
   // Track when this client connected for disconnect timing and $SYS metrics
   (client as any).connectedAt = Date.now();
   sysMetrics.recordClientConnected((aedes as any).connectedClients || 1);
+
+  if ((client as any).clientType === ClientType.PUBLISHER && (client as any).publicKey) {
+    const pubKey = String((client as any).publicKey).toUpperCase();
+    let activeSet = activePublishersByKey.get(pubKey);
+    if (!activeSet) {
+      activeSet = new Set();
+      activePublishersByKey.set(pubKey, activeSet);
+    }
+    activeSet.add(client);
+
+    // Cancel any deferred LWT waiting in the grace window once the replacement session is registered
+    const pendingWill = pendingPublisherWills.get(pubKey);
+    if (pendingWill) {
+      clearTimeout(pendingWill.timer);
+      pendingPublisherWills.delete(pubKey);
+      if (isDebug) {
+        console.log(
+          `${logPrefix} [LWT] Cancelled pending LWT (reconnected within ${Date.now() - pendingWill.scheduledAt}ms)`
+        );
+      }
+    }
+  }
   
   // Hook into the client's stream close event when debug logging is enabled
   const stream = (client as any).stream;
@@ -1319,6 +1762,16 @@ aedes.on('clientDisconnect', (client) => {
     // Clean up subscriber/peer account connection tracking
     const clientType = (client as any).clientType;
     const username = (client as any).username;
+    if (clientType === ClientType.PUBLISHER && (client as any).publicKey) {
+      const pubKey = String((client as any).publicKey).toUpperCase();
+      const activeSet = activePublishersByKey.get(pubKey);
+      if (activeSet) {
+        activeSet.delete(client);
+        if (activeSet.size === 0) {
+          activePublishersByKey.delete(pubKey);
+        }
+      }
+    }
     if ((clientType === ClientType.SUBSCRIBER || clientType === ClientType.PEER) && username) {
       const activeConns = subscriberActiveConnections.get(username);
       if (activeConns) {
@@ -1428,12 +1881,11 @@ wsServer.on('connection', (ws, req) => {
       console.log(`[WEBSOCKET] New WebSocket connection from ${clientIP}`);
     }
   
-    // Enable WebSocket ping/pong to keep connection alive
-    ws.on('ping', (data) => {
+    // Enable WebSocket ping/pong logging (ws v8 autoPong: true already replies with PONG)
+    ws.on('ping', () => {
       if (isDebug) {
-        console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP}, sending PONG`);
+        console.log(`[WEBSOCKET] Received WebSocket PING from ${clientIP} (autoPong enabled)`);
       }
-      ws.pong(data);
     });
     
     ws.on('pong', () => {
@@ -1712,6 +2164,10 @@ function shutdown(): void {
   if (isShuttingDown) return;
   isShuttingDown = true;
   console.log('\n[SHUTDOWN] Closing MQTT broker...');
+  for (const pending of pendingPublisherWills.values()) {
+    clearTimeout(pending.timer);
+  }
+  pendingPublisherWills.clear();
   sysMetrics.stop();
   if (peerBridgeManager) {
     peerBridgeManager.shutdown();

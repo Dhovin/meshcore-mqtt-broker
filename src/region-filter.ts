@@ -152,13 +152,14 @@ export class ObserverRegionBlocklist {
    * Place an Observer's public key on the temporary blocklist.
    */
   public block(publicKey: string, unapprovedIata: string, now: number = Date.now()): void {
-    const normalizedKey = publicKey.trim().toUpperCase();
+    const normalizedKey = publicKey.trim().slice(0, 128).toUpperCase();
     if (!normalizedKey) return;
 
+    const trimmedIata = unapprovedIata.trim();
     const normalizedIata =
-      unapprovedIata.trim().toLowerCase() === 'test'
+      trimmedIata.toLowerCase() === 'test'
         ? 'test'
-        : unapprovedIata.trim().toUpperCase();
+        : trimmedIata.slice(0, 16).toUpperCase();
 
     if (!this.blockedByPubKey.has(normalizedKey) && this.blockedByPubKey.size >= this.maxEntries) {
       this.cleanupExpired(now);
