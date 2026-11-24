@@ -52,6 +52,9 @@ export function loadMqttConfig() {
     console.log(`[CONFIG] Allowed ingestion regions (${allowedRegions.size}): ${Array.from(allowedRegions).join(', ')}`);
   }
 
+  const parsedLwtGraceMs = parseInt(process.env.MQTT_LWT_GRACE_MS || '1000', 10);
+  const lwtGraceMs = !isNaN(parsedLwtGraceMs) && parsedLwtGraceMs >= 0 ? parsedLwtGraceMs : 1000;
+
   return {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),
     tcpPort: parseInt(process.env.MQTT_TCP_PORT || '1883', 10),
@@ -61,6 +64,7 @@ export function loadMqttConfig() {
     httpRedirectUrl: process.env.HTTP_REDIRECT_URL ? process.env.HTTP_REDIRECT_URL.trim() : '',
     maxPacketBytes: parseInt(process.env.MQTT_MAX_PACKET_BYTES || '65536', 10),
     sysIntervalMs: parseInt(process.env.MQTT_SYS_INTERVAL_MS || '10000', 10),
+    lwtGraceMs,
     logLevel,
     allowedRegions,
   };
