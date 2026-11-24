@@ -19,6 +19,8 @@ function validateRequiredEnvVars(vars: string[]): void {
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
+export const MAX_LWT_GRACE_MS = 30_000;
+
 // Validate and load MQTT configuration
 export function loadMqttConfig() {
   validateRequiredEnvVars([
@@ -53,7 +55,15 @@ export function loadMqttConfig() {
   }
 
   const parsedLwtGraceMs = parseInt(process.env.MQTT_LWT_GRACE_MS || '1000', 10);
-  const lwtGraceMs = !isNaN(parsedLwtGraceMs) && parsedLwtGraceMs >= 0 ? parsedLwtGraceMs : 1000;
+  if (!isNaN(parsedLwtGraceMs) && parsedLwtGraceMs > MAX_LWT_GRACE_MS) {
+    console.warn(
+      `[CONFIG] Warning: MQTT_LWT_GRACE_MS (${parsedLwtGraceMs}ms) exceeds maximum ${MAX_LWT_GRACE_MS}ms; clamping to ${MAX_LWT_GRACE_MS}ms`
+    );
+  }
+  const lwtGraceMs =
+    !isNaN(parsedLwtGraceMs) && parsedLwtGraceMs >= 0
+      ? Math.min(parsedLwtGraceMs, MAX_LWT_GRACE_MS)
+      : 1000;
 
   return {
     wsPort: parseInt(process.env.MQTT_WS_PORT!),

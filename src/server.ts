@@ -238,6 +238,36 @@ function suppressWill(client: any): void {
   client._will = null;
 }
 
+// Clear a displaced same-key publisher's in-memory will at exact registration time (after storeWill
+// has already persisted the replacement client's will, and only when the replacement is not closed).
+// Do NOT call persistence.delWill here, or it would erase the replacement client's newly persisted will.
+const originalRegisterClient = (aedes as any).registerClient.bind(aedes);
+(aedes as any).registerClient = (client: any) => {
+  if (
+    client &&
+    !client.closed &&
+    client.clientType === ClientType.PUBLISHER &&
+    client.publicKey
+  ) {
+    const existingClient = (aedes as any).clients?.[client.id];
+    if (
+      existingClient &&
+      existingClient !== client &&
+      existingClient.clientType === ClientType.PUBLISHER &&
+      existingClient.publicKey === client.publicKey
+    ) {
+      if (isDebug) {
+        console.log(
+          `${getClientLogPrefix(client)} [LWT] Suppressing will on displaced session takeover (clientId: ${client.id})`
+        );
+      }
+      existingClient.will = null;
+      existingClient._will = null;
+    }
+  }
+  return originalRegisterClient(client);
+};
+
 // Track active Publisher clients per uppercase publicKey (for LWT reconnect suppression)
 const activePublishersByKey = new Map<string, Set<any>>();
 
@@ -256,8 +286,24 @@ const pendingPublisherWills = new Map<string, PendingPublisherWill>();
 const lastStatusTimestamps = new Map<string, number>();
 const MAX_STATUS_ORIGINS = 10_000;
 const MAX_FUTURE_STATUS_SKEW_MS = 60_000;
+const MAX_TOPIC_LENGTH = 256;
 const ZONELESS_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 const FIFTEEN_MINUTES_MS = 15 * 60 * 1000;
+
+function formatTopicForLog(topic: string): string {
+  return topic.length > 128 ? `${topic.slice(0, 128)}... (${topic.length}B)` : topic;
+}
+
+function recordLastStatusTimestamp(originId: string, effectiveTimestamp: number): void {
+  if (!originId || !effectiveTimestamp || isNaN(effectiveTimestamp)) return;
+  const existing = lastStatusTimestamps.get(originId) || 0;
+  if (effectiveTimestamp <= existing) return;
+  if (!lastStatusTimestamps.has(originId) && lastStatusTimestamps.size >= MAX_STATUS_ORIGINS) {
+    const oldestKey = lastStatusTimestamps.keys().next().value;
+    if (oldestKey) lastStatusTimestamps.delete(oldestKey);
+  }
+  lastStatusTimestamps.set(originId, effectiveTimestamp);
+}
 
 function parseStatusTimestampMs(rawTs: unknown, nowMs: number = Date.now()): number {
   if (typeof rawTs === 'number') {
@@ -292,17 +338,30 @@ function parseStatusTimestampMs(rawTs: unknown, nowMs: number = Date.now()): num
   return isNaN(parsed) ? 0 : parsed;
 }
 
-function refreshLwtPayloadIfStale(message: any, originKey: string, originalPayload: Buffer): Buffer {
-  const lastTs = lastStatusTimestamps.get(originKey) || 0;
-  if (lastTs <= 0 || !message || typeof message !== 'object' || message.timestamp === undefined) {
-    return originalPayload;
+function refreshLwtPayloadIfStale(
+  message: any,
+  originKey: string,
+  originalPayload: Buffer,
+  client: any
+): Buffer | null {
+  const globalLastTs = lastStatusTimestamps.get(originKey) || 0;
+  const ownLastTs = (client as any)?.lastOwnStatusTs || 0;
+  const now = Date.now();
+  const rawWillTs =
+    message && typeof message === 'object' && message.timestamp !== undefined
+      ? parseStatusTimestampMs(message.timestamp, now)
+      : 0;
+  const clampedWillTs = rawWillTs > 0 ? Math.min(rawWillTs, now + MAX_FUTURE_STATUS_SKEW_MS) : 0;
+  const effectiveOwnTs = Math.max(ownLastTs, clampedWillTs);
+
+  // If a newer status arrived from another session or peered broker, drop this stale will
+  if (globalLastTs > effectiveOwnTs) {
+    return null;
   }
-  const rawTs = parseStatusTimestampMs(message.timestamp, Date.now());
-  if (rawTs > 0 && rawTs < lastTs) {
-    // Advance only to lastTs (staying in the observer's own clock domain so slow-clock
-    // observers are never blocked as stale on immediate reconnect, while satisfying >= lastTs
-    // both locally and on downstream peer brokers).
-    const updatedMessage = { ...message, timestamp: new Date(lastTs).toISOString() };
+
+  // Advance CONNECT-time LWT only up to this dying session's own last status timestamp
+  if (ownLastTs > 0 && rawWillTs > 0 && rawWillTs < ownLastTs) {
+    const updatedMessage = { ...message, timestamp: new Date(ownLastTs).toISOString() };
     const updatedBuf = Buffer.from(JSON.stringify(updatedMessage), 'utf-8');
     parsedPayloadCache.set(updatedBuf, updatedMessage);
     return updatedBuf;
@@ -321,13 +380,14 @@ function denyAndClosePublisher(
   callback: (err?: Error | null) => void,
   blockIata?: string
 ): void {
+  const safeTopic = formatTopicForLog(packet.topic);
   if (isWillPacket) {
-    console.log(`${logPrefix} [AUTHZ] ✗ Will denied -> ${packet.topic} (${reasonTag})`);
+    console.log(`${logPrefix} [AUTHZ] ✗ Will denied -> ${safeTopic} (${reasonTag})`);
     sysMetrics.recordUnauthorizedPublish();
     callback(new Error(errMessage));
     return;
   }
-  console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (${reasonTag})`);
+  console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${safeTopic} (${reasonTag})`);
   console.log(`${logPrefix} [DISCONNECT] Closing client - ${disconnectReason}`);
   if (blockIata && client.publicKey) {
     observerRegionBlocklist.block(client.publicKey.toUpperCase(), blockIata);
@@ -724,32 +784,6 @@ aedes.authenticate = async (client, username, password, callback) => {
       stream.authenticated = true;
       stream.client = client;
     }
-    
-    // Cancel any deferred LWT waiting in the grace window for this reconnecting observer
-    const pendingWill = pendingPublisherWills.get(publicKey);
-    if (pendingWill) {
-      clearTimeout(pendingWill.timer);
-      pendingPublisherWills.delete(publicKey);
-      if (isDebug) {
-        console.log(
-          `[O:${shortKey}] [LWT] Cancelled pending LWT (reconnected within ${Date.now() - pendingWill.scheduledAt}ms)`
-        );
-      }
-    }
-
-    // Suppress the displaced client's LWT only on verified same-key publisher session takeover
-    const existingClient = (aedes as any).clients?.[client.id];
-    if (
-      existingClient &&
-      existingClient !== client &&
-      (existingClient as any).clientType === ClientType.PUBLISHER &&
-      (existingClient as any).publicKey === publicKey
-    ) {
-      if (isDebug) {
-        console.log(`[O:${shortKey}] [LWT] Suppressing will on displaced session takeover (clientId: ${client.id})`);
-      }
-      suppressWill(existingClient);
-    }
 
     // Initialize abuse detection tracking
     const clientIP = stream?.clientIP;
@@ -783,9 +817,41 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
   // Enforce maximum packet payload size to prevent event loop freezes and memory exhaustion
   if (packet.payload && packet.payload.length > mqttConfig.maxPacketBytes) {
-    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${packet.topic} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${formatTopicForLog(packet.topic)} (payload size ${packet.payload.length}B exceeds limit ${mqttConfig.maxPacketBytes}B)`);
     sysMetrics.recordUnauthorizedPublish();
     callback(new Error(`Payload size exceeds maximum allowed size of ${mqttConfig.maxPacketBytes} bytes`));
+    return;
+  }
+
+  // Enforce maximum topic length before parsing segments or storing/logging topic strings
+  if (packet.topic && packet.topic.length > MAX_TOPIC_LENGTH) {
+    const safeTopic = formatTopicForLog(packet.topic);
+    if (clientType === ClientType.PEER) {
+      if (isDebug) {
+        console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${safeTopic} (topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+      }
+      sysMetrics.recordUnauthorizedPublish();
+      sysMetrics.recordInboundPeerInvalid(client);
+      dropPacketSilently(packet, callback);
+      return;
+    }
+    if (clientType === ClientType.PUBLISHER) {
+      denyAndClosePublisher(
+        client,
+        packet,
+        isWillPacket,
+        logPrefix,
+        `topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B`,
+        `Topic exceeds maximum length (${MAX_TOPIC_LENGTH}B)`,
+        `Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`,
+        callback,
+        'INVALID'
+      );
+      return;
+    }
+    console.log(`${logPrefix} [AUTHZ] ✗ Publish denied -> ${safeTopic} (topic length ${packet.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+    sysMetrics.recordUnauthorizedPublish();
+    callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
     return;
   }
   
@@ -895,6 +961,18 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
 
     packet.topic = validation.normalizedTopic!;
     const subtopic = validation.subtopic!;
+    if (validation.enrichedPayload) {
+      if (validation.enrichedPayload.length > mqttConfig.maxPacketBytes) {
+        if (isDebug) {
+          console.log(`${logPrefix} [AUTHZ] ✗ Peer publish dropped -> ${packet.topic} (enriched payload exceeds limit ${mqttConfig.maxPacketBytes}B)`);
+        }
+        sysMetrics.recordUnauthorizedPublish();
+        sysMetrics.recordInboundPeerInvalid(client);
+        dropPacketSilently(packet, callback);
+        return;
+      }
+      packet.payload = validation.enrichedPayload;
+    }
     const payloadBuf = ensureBuffer(packet.payload);
 
     // Deduplicate cross-path packets (e.g., dual-connected observers or multi-hop topologies)
@@ -934,6 +1012,17 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
           }
           dropPacketSilently(packet, callback);
           return;
+        }
+      }
+
+      // Advance lastStatusTimestamps immediately on authorized peer /status publishes so even
+      // a broker with 0 local subscribers detects failover to another broker before firing stale LWTs
+      if (subtopic === 'status' && validation.parsedMessage.timestamp !== undefined) {
+        const peerStatusNow = Date.now();
+        const peerRawTs = parseStatusTimestampMs(validation.parsedMessage.timestamp, peerStatusNow);
+        if (peerRawTs > 0) {
+          const peerEffectiveTs = Math.min(peerRawTs, peerStatusNow + MAX_FUTURE_STATUS_SKEW_MS);
+          recordLastStatusTimestamp(originKey, peerEffectiveTs);
         }
       }
     }
@@ -991,16 +1080,17 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
     if (!isTestRegion) {
       // First check format (must be 3 uppercase letters, no normalization)
       if (!iataRegex.test(locationCode)) {
+        const safeLoc = locationCode.length > 32 ? `${locationCode.slice(0, 32)}...` : locationCode;
         denyAndClosePublisher(
           client,
           packet,
           isWillPacket,
           logPrefix,
           'invalid format',
-          `Invalid location format: "${locationCode}"`,
+          `Invalid location format: "${safeLoc}"`,
           'Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"',
           callback,
-          locationCode
+          'INVALID'
         );
         return;
       }
@@ -1253,7 +1343,14 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
               }
               return;
             }
-            const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf);
+            const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf, client);
+            if (!refreshedBuf) {
+              if (isDebug) {
+                console.log(`${logPrefix} [LWT] Dropping stale deferred LWT (newer status received from another session or peer)`);
+              }
+              sysMetrics.recordStaleStatusFiltered();
+              return;
+            }
             (aedes as any).publish(
               {
                 cmd: 'publish',
@@ -1307,7 +1404,15 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
           }
         }
 
-        const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf);
+        const refreshedBuf = refreshLwtPayloadIfStale(message, clientPublicKey, originalPayloadBuf, client);
+        if (!refreshedBuf) {
+          if (isDebug) {
+            console.log(`${logPrefix} [LWT] Dropping stale LWT (newer status received from another session or peer)`);
+          }
+          sysMetrics.recordStaleStatusFiltered();
+          dropPacketSilently(packet, callback);
+          return;
+        }
         if (refreshedBuf !== originalPayloadBuf) {
           packet.payload = refreshedBuf;
           (packet as any)._parsedJson = getParsedJson(refreshedBuf);
@@ -1317,6 +1422,15 @@ aedes.authorizePublish = (client, packet, rawCallback) => {
         }
         callback(null);
         return;
+      }
+
+      if (subtopic === 'status' && message.timestamp !== undefined) {
+        const nowMs = Date.now();
+        const ownRawTs = parseStatusTimestampMs(message.timestamp, nowMs);
+        if (ownRawTs > 0) {
+          const ownEffectiveTs = Math.min(ownRawTs, nowMs + MAX_FUTURE_STATUS_SKEW_MS);
+          (client as any).lastOwnStatusTs = Math.max((client as any).lastOwnStatusTs || 0, ownEffectiveTs);
+        }
       }
       
       if (isDebug) {
@@ -1363,6 +1477,24 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
   const logPrefix = getClientLogPrefix(client);
   const clientType = (client as any).clientType;
 
+  // Enforce maximum topic length before parsing segments or storing/logging topic strings
+  if (subscription.topic && subscription.topic.length > MAX_TOPIC_LENGTH) {
+    const safeTopic = formatTopicForLog(subscription.topic);
+    console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${safeTopic} (topic length ${subscription.topic.length}B exceeds limit ${MAX_TOPIC_LENGTH}B)`);
+    if (clientType === ClientType.PUBLISHER) {
+      const clientPublicKey = ((client as any).publicKey || '').toUpperCase();
+      if (clientPublicKey) {
+        observerRegionBlocklist.block(clientPublicKey, 'INVALID');
+      }
+      suppressWill(client);
+      callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
+      client.close();
+      return;
+    }
+    callback(new Error(`Topic exceeds maximum allowed length of ${MAX_TOPIC_LENGTH} bytes`));
+    return;
+  }
+
   // Peer clients are publish-only
   if (clientType === ClientType.PEER) {
     console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied (peer) -> ${subscription.topic}`);
@@ -1381,15 +1513,19 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
         if (topicPublicKey === clientPublicKey && clientPublicKey.length === 64) {
           const isTestRegion = iata.toLowerCase() === 'test';
           const normalizedIata = isTestRegion ? 'test' : iata.toUpperCase();
+          const safeIata = iata.length > 32 ? `${iata.slice(0, 32)}...` : iata;
           let badReason: string | null = null;
           let errMessage = '';
+          let blockCode = normalizedIata;
 
           if (iata === 'XXX') {
             badReason = 'XXX is a placeholder location code';
             errMessage = 'XXX is a placeholder - please configure your actual IATA location code';
+            blockCode = 'XXX';
           } else if (!isTestRegion && !/^[A-Z]{3}$/.test(iata)) {
-            badReason = `Invalid location format: "${iata}"`;
+            badReason = `Invalid location format: "${safeIata}"`;
             errMessage = 'Location must be exactly 3 uppercase letters (e.g., SEA, PDX, BOS) or "test"';
+            blockCode = 'INVALID';
           } else if (!isTestRegion && !ALLOWED_REGIONS?.has(normalizedIata) && !isValidIATACode(iata)) {
             badReason = `Invalid IATA code: "${iata}"`;
             errMessage = 'Location must be a valid IATA international airport code or "test"';
@@ -1399,9 +1535,9 @@ aedes.authorizeSubscribe = (client, subscription, callback) => {
           }
 
           if (badReason) {
-            console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${subscription.topic} (${badReason})`);
+            console.log(`${logPrefix} [AUTHZ] ✗ Subscribe denied -> ${formatTopicForLog(subscription.topic)} (${badReason})`);
             console.log(`${logPrefix} [DISCONNECT] Closing client and blocking observer for 60s - ${badReason}`);
-            observerRegionBlocklist.block(clientPublicKey, iata);
+            observerRegionBlocklist.block(clientPublicKey, blockCode);
             suppressWill(client);
             callback(new Error(errMessage));
             client.close();
@@ -1487,12 +1623,8 @@ aedes.authorizeForward = (client, packet) => {
           sysMetrics.recordStaleStatusFiltered();
           return null;
         }
-        
-        if (!lastStatusTimestamps.has(originId) && lastStatusTimestamps.size >= MAX_STATUS_ORIGINS) {
-          const oldestKey = lastStatusTimestamps.keys().next().value;
-          if (oldestKey) lastStatusTimestamps.delete(oldestKey);
-        }
-        lastStatusTimestamps.set(originId, effectiveTimestamp);
+
+        recordLastStatusTimestamp(originId, effectiveTimestamp);
       }
     } catch (error) {
       if (isDebug) {
@@ -1582,6 +1714,18 @@ aedes.on('client', (client) => {
       activePublishersByKey.set(pubKey, activeSet);
     }
     activeSet.add(client);
+
+    // Cancel any deferred LWT waiting in the grace window once the replacement session is registered
+    const pendingWill = pendingPublisherWills.get(pubKey);
+    if (pendingWill) {
+      clearTimeout(pendingWill.timer);
+      pendingPublisherWills.delete(pubKey);
+      if (isDebug) {
+        console.log(
+          `${logPrefix} [LWT] Cancelled pending LWT (reconnected within ${Date.now() - pendingWill.scheduledAt}ms)`
+        );
+      }
+    }
   }
   
   // Hook into the client's stream close event when debug logging is enabled

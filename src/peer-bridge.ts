@@ -112,6 +112,7 @@ export interface PeerValidationResult {
   normalizedLocation?: string;
   subtopic?: string;
   parsedMessage?: any;
+  enrichedPayload?: Buffer;
 }
 
 // Validate inbound packet published by a peer broker
@@ -162,9 +163,14 @@ export function validatePeerPacket(
     }
 
     let originId: string;
+    let finalMessage = message;
+    let enrichedPayload: Buffer | undefined;
     if (subtopic === 'packets' && (message.origin_id === undefined || message.origin_id === '')) {
       // Allow slim /packets payloads (e.g. OffbandMesh #727 sec4) forwarded from peers
+      // and populate origin_id from the validated topic public key for a consistent contract
       originId = topicPublicKey;
+      finalMessage = { ...message, origin_id: originId };
+      enrichedPayload = Buffer.from(JSON.stringify(finalMessage), 'utf-8');
     } else {
       if (typeof message.origin_id !== 'string' || !/^[0-9A-F]{64}$/i.test(message.origin_id.trim())) {
         return { valid: false, error: 'Message payload must contain valid 64-hex origin_id' };
@@ -185,7 +191,8 @@ export function validatePeerPacket(
       originId,
       normalizedLocation,
       subtopic,
-      parsedMessage: message,
+      parsedMessage: finalMessage,
+      enrichedPayload,
     };
   } catch {
     return { valid: false, error: 'Invalid JSON payload in peer packet' };

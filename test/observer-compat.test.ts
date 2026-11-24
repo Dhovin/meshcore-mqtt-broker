@@ -10,6 +10,8 @@ import WebSocket from 'ws';
 import mqttPacket from 'mqtt-packet';
 import { derivePeerKeyPair, createPeerJwt } from '../src/peer-crypto.js';
 import { validatePeerPacket } from '../src/peer-bridge.js';
+import { ObserverRegionBlocklist } from '../src/region-filter.js';
+import { loadMqttConfig, MAX_LWT_GRACE_MS } from '../src/config.js';
 
 function getFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -315,6 +317,9 @@ describe('Observer Compatibility: Unit Tests', () => {
     assert.strictEqual(resPackets.valid, true);
     assert.strictEqual(resPackets.originId, validPubKey);
     assert.strictEqual(resPackets.normalizedTopic, `meshcore/SEA/${validPubKey}/packets`);
+    assert.strictEqual(resPackets.parsedMessage.origin_id, validPubKey);
+    assert.ok(resPackets.enrichedPayload);
+    assert.strictEqual(JSON.parse(resPackets.enrichedPayload.toString('utf-8')).origin_id, validPubKey);
 
     const missingOnStatus = validatePeerPacket(
       `meshcore/SEA/${validPubKey}/status`,
@@ -331,6 +336,40 @@ describe('Observer Compatibility: Unit Tests', () => {
     );
     assert.strictEqual(mismatchOnPackets.valid, false);
     assert.match(mismatchOnPackets.error!, /origin_id in payload must match/);
+  });
+
+  it('bounds stored unapprovedIata length in ObserverRegionBlocklist.block()', () => {
+    const blocklist = new ObserverRegionBlocklist(60_000, 100, 0);
+    try {
+      blocklist.block(validPubKey, 'a'.repeat(60000));
+      const stats = blocklist.getStats();
+      assert.strictEqual(stats.blockedObservers.length, 1);
+      assert.strictEqual(stats.blockedObservers[0].unapprovedIata, 'A'.repeat(16));
+      assert.ok(stats.blockedObservers[0].unapprovedIata.length <= 16);
+    } finally {
+      blocklist.destroy();
+    }
+  });
+
+  it('clamps MQTT_LWT_GRACE_MS to MAX_LWT_GRACE_MS (30s) in loadMqttConfig()', () => {
+    const prevWs = process.env.MQTT_WS_PORT;
+    const prevHost = process.env.MQTT_HOST;
+    const prevAud = process.env.AUTH_EXPECTED_AUDIENCE;
+    const prevGrace = process.env.MQTT_LWT_GRACE_MS;
+    try {
+      process.env.MQTT_WS_PORT = '8883';
+      process.env.MQTT_HOST = '127.0.0.1';
+      process.env.AUTH_EXPECTED_AUDIENCE = 'audit.meshcore.local';
+      process.env.MQTT_LWT_GRACE_MS = '999999';
+      const cfg = loadMqttConfig();
+      assert.strictEqual(cfg.lwtGraceMs, MAX_LWT_GRACE_MS);
+      assert.strictEqual(cfg.lwtGraceMs, 30_000);
+    } finally {
+      if (prevWs === undefined) delete process.env.MQTT_WS_PORT; else process.env.MQTT_WS_PORT = prevWs;
+      if (prevHost === undefined) delete process.env.MQTT_HOST; else process.env.MQTT_HOST = prevHost;
+      if (prevAud === undefined) delete process.env.AUTH_EXPECTED_AUDIENCE; else process.env.AUTH_EXPECTED_AUDIENCE = prevAud;
+      if (prevGrace === undefined) delete process.env.MQTT_LWT_GRACE_MS; else process.env.MQTT_LWT_GRACE_MS = prevGrace;
+    }
   });
 });
 
@@ -522,19 +561,54 @@ describe('Observer Compatibility: End-to-End Broker Verification', () => {
         'Overlapping same-key takeover must suppress offline LWT'
       );
 
-      // 2. Non-overlapping rapid reconnect within MQTT_LWT_GRACE_MS=400ms
+      // Verify c2 retained its own LWT after displacing c1
+      await c2.publish(
+        `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+        JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'online', timestamp: new Date().toISOString() })
+      );
       const c2Closed = c2.waitForClose(3000);
       c2.ws.terminate();
       await c2Closed;
+
+      await sub.waitForMessage(
+        (m) => m.topic.endsWith('/status') && JSON.parse(m.payload).status === 'offline',
+        2000
+      );
+      const offlineAfterC2 = sub.received.filter(
+        (m) => m.topic.endsWith('/status') && JSON.parse(m.payload).status === 'offline'
+      ).length;
+      assert.strictEqual(offlineAfterC2, 1, 'Replacement session c2 must keep its own LWT after takeover');
+
+      // 2. Non-overlapping rapid reconnect within MQTT_LWT_GRACE_MS=400ms
+      const c3 = await connectMqttWsClient(wsUrl, 'renew_id_2', `v1_${obsKey.publicKeyHex}`, validJwt, {
+        topic: `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+        payload: Buffer.from(
+          JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'offline', timestamp: new Date().toISOString() }),
+          'utf-8'
+        ),
+        qos: 0,
+        retain: false,
+      });
+      clients.push(c3);
+      await c3.publish(
+        `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+        JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'online', timestamp: new Date().toISOString() })
+      );
+      const c3Closed = c3.waitForClose(3000);
+      c3.ws.terminate();
+      await c3Closed;
       await new Promise((r) => setTimeout(r, 50));
 
-      const c3 = await connectMqttWsClient(wsUrl, 'renew_id_2', `v1_${obsKey.publicKeyHex}`, validJwt);
-      clients.push(c3);
+      const c4 = await connectMqttWsClient(wsUrl, 'renew_id_3', `v1_${obsKey.publicKeyHex}`, validJwt);
+      clients.push(c4);
       await new Promise((r) => setTimeout(r, 600));
 
+      const offlineAfterC3 = sub.received.filter(
+        (m) => m.topic.endsWith('/status') && JSON.parse(m.payload).status === 'offline'
+      ).length;
       assert.strictEqual(
-        sub.received.some((m) => m.topic.endsWith('/status') && JSON.parse(m.payload).status === 'offline'),
-        false,
+        offlineAfterC3,
+        1,
         'Rapid reconnect within grace window must cancel deferred offline LWT'
       );
     } finally {
@@ -710,6 +784,205 @@ describe('Observer Compatibility: End-to-End Broker Verification', () => {
     } finally {
       for (const c of clients) c.close();
       broker?.proc.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 150));
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('prevents blocklist memory exhaustion on oversized or invalid-format topics on publish and subscribe', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-compat-blockcap-'));
+    const port = await getFreePort();
+    const audience = 'compat.meshcore.local';
+    const k1 = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const k2 = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const k3 = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const clients: MqttWsClient[] = [];
+    let brokerProc: ChildProcess | undefined;
+
+    try {
+      const broker = await spawnBroker('blockcap', port, audience, tempDir, {
+        MQTT_SYS_INTERVAL_MS: '250',
+      });
+      brokerProc = broker.proc;
+      const wsUrl = `ws://127.0.0.1:${port}`;
+
+      const sub = await connectMqttWsClient(wsUrl, 'sub_admin', 'admin', 'adminpass123');
+      clients.push(sub);
+      await sub.subscribe('$SYS/broker/security/region_filter');
+
+      // 1. Oversized publish topic (60KB segment -> blocked as INVALID via MAX_TOPIC_LENGTH)
+      const c1 = await connectMqttWsClient(
+        wsUrl,
+        'huge_pub',
+        `v1_${k1.publicKeyHex}`,
+        await createPeerJwt(k1, audience, 3600)
+      );
+      clients.push(c1);
+      const c1Closed = c1.waitForClose(3000);
+      await c1.publish(
+        `meshcore/${'A'.repeat(60000)}/${k1.publicKeyHex}/status`,
+        JSON.stringify({ origin_id: k1.publicKeyHex, status: 'online' })
+      );
+      await c1Closed;
+
+      // 2. Oversized subscribe topic (60KB segment -> blocked as INVALID via MAX_TOPIC_LENGTH)
+      const c2 = await connectMqttWsClient(
+        wsUrl,
+        'huge_sub',
+        `v1_${k2.publicKeyHex}`,
+        await createPeerJwt(k2, audience, 3600)
+      );
+      clients.push(c2);
+      const c2Closed = c2.waitForClose(3000);
+      await c2.subscribe(`meshcore/${'B'.repeat(60000)}/${k2.publicKeyHex}/serial/commands`).catch(() => {});
+      await c2Closed;
+
+      // 3. Under-256B invalid format location code (blocked as INVALID without storing raw segment)
+      const c3 = await connectMqttWsClient(
+        wsUrl,
+        'bad_fmt_pub',
+        `v1_${k3.publicKeyHex}`,
+        await createPeerJwt(k3, audience, 3600)
+      );
+      clients.push(c3);
+      const c3Closed = c3.waitForClose(3000);
+      await c3.publish(
+        `meshcore/INVALID_LONG_REGION_CODE_12345/${k3.publicKeyHex}/status`,
+        JSON.stringify({ origin_id: k3.publicKeyHex, status: 'online' })
+      );
+      await c3Closed;
+
+      const sysMsg = await sub.waitForMessage((m) => {
+        if (m.topic !== '$SYS/broker/security/region_filter') return false;
+        const data = JSON.parse(m.payload);
+        return (data.observerBlocklist?.blockedObservers?.length || 0) >= 3;
+      }, 3000);
+
+      const blockedObservers = JSON.parse(sysMsg.payload).observerBlocklist.blockedObservers;
+      assert.strictEqual(blockedObservers.length, 3);
+      for (const rec of blockedObservers) {
+        assert.strictEqual(rec.unapprovedIata, 'INVALID');
+        assert.ok(rec.unapprovedIata.length <= 16);
+      }
+    } finally {
+      for (const c of clients) c.close();
+      brokerProc?.kill('SIGTERM');
+      await new Promise((r) => setTimeout(r, 150));
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops stale LWT when a newer status arrives from a peered broker (grace > 0 and grace = 0)', async () => {
+    for (const graceMs of ['250', '0']) {
+      const tempDir = mkdtempSync(join(tmpdir(), `meshcore-compat-peer-lwt-${graceMs}-`));
+      const port = await getFreePort();
+      const audience = 'compat.meshcore.local';
+      const obsKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+      const peerKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+      const clients: MqttWsClient[] = [];
+      let brokerProc: ChildProcess | undefined;
+
+      try {
+        const broker = await spawnBroker(`peer-lwt-${graceMs}`, port, audience, tempDir, {
+          AUTHORIZED_PEERS: peerKey.publicKeyHex,
+          MQTT_LWT_GRACE_MS: graceMs,
+        });
+        brokerProc = broker.proc;
+        const wsUrl = `ws://127.0.0.1:${port}`;
+
+        const sub = await connectMqttWsClient(wsUrl, 'sub_admin', 'admin', 'adminpass123');
+        clients.push(sub);
+        await sub.subscribe('meshcore/#');
+
+        const nowMs = Date.now();
+        const t0Iso = new Date(nowMs - 5000).toISOString();
+        const t1Iso = new Date(nowMs - 2000).toISOString();
+        const t2Iso = new Date(nowMs).toISOString();
+
+        const obsJwt = await createPeerJwt(obsKey, audience, 3600);
+        const obsClient = await connectMqttWsClient(wsUrl, 'obs_a', `v1_${obsKey.publicKeyHex}`, obsJwt, {
+          topic: `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+          payload: Buffer.from(
+            JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'offline', timestamp: t0Iso }),
+            'utf-8'
+          ),
+          qos: 0,
+          retain: false,
+        });
+        clients.push(obsClient);
+
+        await obsClient.publish(
+          `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+          JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'online', timestamp: t1Iso })
+        );
+        await sub.waitForMessage((m) => m.topic.endsWith('/status') && JSON.parse(m.payload).timestamp === t1Iso);
+
+        // Simulated failover: Broker B forwards newer "online" status via Peer link
+        const peerJwt = await createPeerJwt(peerKey, audience, 3600);
+        const peerClient = await connectMqttWsClient(wsUrl, 'peer_b', `v1_${peerKey.publicKeyHex}`, peerJwt);
+        clients.push(peerClient);
+        await peerClient.publish(
+          `meshcore/SEA/${obsKey.publicKeyHex}/status`,
+          JSON.stringify({ origin_id: obsKey.publicKeyHex, status: 'online', timestamp: t2Iso })
+        );
+        await sub.waitForMessage((m) => m.topic.endsWith('/status') && JSON.parse(m.payload).timestamp === t2Iso);
+
+        // Dying connection on Broker A terminates abruptly
+        const obsClosed = obsClient.waitForClose(3000);
+        obsClient.ws.terminate();
+        await obsClosed;
+
+        await new Promise((r) => setTimeout(r, parseInt(graceMs, 10) + 300));
+        assert.strictEqual(
+          sub.received.some((m) => m.topic.endsWith('/status') && JSON.parse(m.payload).status === 'offline'),
+          false,
+          `Stale LWT with MQTT_LWT_GRACE_MS=${graceMs} must not overwrite newer peered online status`
+        );
+      } finally {
+        for (const c of clients) c.close();
+        brokerProc?.kill('SIGTERM');
+        await new Promise((r) => setTimeout(r, 150));
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('enriches inbound peer slim /packets missing origin_id', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'meshcore-compat-peer-slim-'));
+    const port = await getFreePort();
+    const audience = 'compat.meshcore.local';
+    const obsKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const peerKey = await derivePeerKeyPair(crypto.randomBytes(32).toString('hex'));
+    const clients: MqttWsClient[] = [];
+    let brokerProc: ChildProcess | undefined;
+
+    try {
+      const broker = await spawnBroker('peer-slim', port, audience, tempDir, {
+        AUTHORIZED_PEERS: peerKey.publicKeyHex,
+      });
+      brokerProc = broker.proc;
+      const wsUrl = `ws://127.0.0.1:${port}`;
+
+      const sub = await connectMqttWsClient(wsUrl, 'sub_admin', 'admin', 'adminpass123');
+      clients.push(sub);
+      await sub.subscribe('meshcore/#');
+
+      const peerJwt = await createPeerJwt(peerKey, audience, 3600);
+      const peerClient = await connectMqttWsClient(wsUrl, 'peer_in', `v1_${peerKey.publicKeyHex}`, peerJwt);
+      clients.push(peerClient);
+
+      await peerClient.publish(
+        `meshcore/SEA/${obsKey.publicKeyHex}/packets`,
+        JSON.stringify({ type: 'PACKET', direction: 'rx', raw: '1500CAFEBABE' })
+      );
+
+      const pktMsg = await sub.waitForMessage((m) => m.topic.endsWith('/packets'));
+      const parsed = JSON.parse(pktMsg.payload);
+      assert.strictEqual(parsed.origin_id, obsKey.publicKeyHex);
+      assert.strictEqual(parsed.raw, '1500CAFEBABE');
+    } finally {
+      for (const c of clients) c.close();
+      brokerProc?.kill('SIGTERM');
       await new Promise((r) => setTimeout(r, 150));
       rmSync(tempDir, { recursive: true, force: true });
     }
